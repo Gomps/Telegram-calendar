@@ -150,7 +150,11 @@ class Database:
             # no-op здесь означал бы «✅ Запомнил» без реального сохранения
             raise RuntimeError(f"update_context: пользователь {user_id} не зарегистрирован")
         ctx = json.loads(row["context_json"])
-        ctx.update(updates)
+        for key, value in updates.items():
+            if value is None:  # null = удалить ключ
+                ctx.pop(key, None)
+            else:
+                ctx[key] = value
         await self.db.execute(
             "UPDATE users SET context_json = ? WHERE user_id = ?",
             (json.dumps(ctx, ensure_ascii=False), user_id),

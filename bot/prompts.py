@@ -27,7 +27,8 @@ SCHEMA = """\
     "interval_minutes": 60,                       // для interval
     "start_anchor": {"kind": "context", "key": "work_end", "offset_minutes": 0}
                   | {"kind": "time", "time": "18:00", "offset_minutes": 0},
-    "end_anchor": { так же }                      // для interval
+    "end_anchor": { так же },                     // для interval
+    "exclude": [{"start_anchor": {...}, "end_anchor": {...}}]  // окна-исключения («но не в обед»)
   },
   "clarification_question": "один короткий вопрос", // для ask_clarification
   "missing_fields": ["work_end"],                   // для ask_clarification
@@ -68,7 +69,10 @@ RULES = """\
 17. reminder_text составляй ТОЛЬКО из слов пользователя (можно менять форму слова: «полей» -> «полить»). НЕ заменяй слова синонимами и не придумывай новые — иначе исказится смысл.
 18. Дни недели вычисляй по календарю ниже. «в субботу» = ближайшая суббота; «в следующую субботу» = суббота следующей недели.
 19. В условных напоминаниях время без указания дня относится к дню условия: «Если проснусь в субботу в 12:00 — напомни в 14:00 поесть» -> напоминание в СУББОТУ в 14:00.
-20. «По чётным/нечётным дням», «только по пятницам» и их сочетания: в контексте — списком вариантов с when, в recurring — полями day_parity и days_of_week (действуют вместе)."""
+20. «По чётным/нечётным дням», «только по пятницам» и их сочетания: в контексте — списком вариантов с when, в recurring — полями day_parity и days_of_week (действуют вместе).
+21. offset_minutes задавай ТОЛЬКО если пользователь явно сказал «за N часов/минут до». «С начала рабочего дня до конца рабочего дня» = start work_start offset 0, end work_end offset 0 — БЕЗ смещений. Якоря выбирай точно по словам пользователя: «когда я на работе» = work_start..work_end (НЕ sleep_*).
+22. «Но не в обеденное время / кроме обеда» -> recurring.exclude с окном lunch_start..lunch_end (если этих ключей нет в контексте — задай уточняющий вопрос).
+23. Чтобы УДАЛИТЬ ключ из контекста («я больше не хожу в спортзал», «забудь про обед»), передай в context_updates значение null: {"gym_time": null}."""
 
 EXAMPLES = """\
 Примеры (сегодня четверг 2026-07-02, контекст: {"work_start": "09:00", "work_end": "18:00", "sleep_start": "23:00", "lunch_end": "13:00"}):
@@ -114,6 +118,15 @@ EXAMPLES = """\
 
 Сообщение (контекст без work_end): «Напомни после работы забрать посылку»
 Ответ: {"action": "ask_clarification", "clarification_question": "Во сколько ты заканчиваешь работу?", "missing_fields": ["work_end"]}
+
+Сообщение: «С начала рабочего дня до конца рабочего дня напоминай мне раз в час учить русский»
+Ответ: {"action": "create_recurring", "reminder_text": "Учить русский", "recurring": {"type": "interval", "days_of_week": null, "interval_minutes": 60, "start_anchor": {"kind": "context", "key": "work_start", "offset_minutes": 0}, "end_anchor": {"kind": "context", "key": "work_end", "offset_minutes": 0}}}
+
+Сообщение (в контексте есть lunch_start и lunch_end): «Когда я на работе напоминай мне раз в час учить английский, но не в обеденное время»
+Ответ: {"action": "create_recurring", "reminder_text": "Учить английский", "recurring": {"type": "interval", "days_of_week": null, "interval_minutes": 60, "start_anchor": {"kind": "context", "key": "work_start", "offset_minutes": 0}, "end_anchor": {"kind": "context", "key": "work_end", "offset_minutes": 0}, "exclude": [{"start_anchor": {"kind": "context", "key": "lunch_start", "offset_minutes": 0}, "end_anchor": {"kind": "context", "key": "lunch_end", "offset_minutes": 0}}]}}
+
+Сообщение: «Я больше не хожу в спортзал, забудь об этом»
+Ответ: {"action": "save_context", "context_updates": {"gym_time": null}}
 
 Сообщение: «По чётным дням я работаю до 16:30, по нечётным — до 18»
 Ответ: {"action": "save_context", "context_updates": {"work_end": [{"value": "16:30", "when": {"day_parity": "even"}}, {"value": "18:00", "when": {"day_parity": "odd"}}]}}

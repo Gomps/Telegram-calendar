@@ -71,6 +71,8 @@ def normalize_action(data: dict) -> dict:
     updates = data.get("context_updates")
     if isinstance(updates, dict):
         for key, value in list(updates.items()):
+            if value is None:  # null = удалить ключ из контекста
+                continue
             if isinstance(value, list):
                 # условные значения: [{"value": "16.30", "when": {...}}, ...]
                 for entry in value:
@@ -206,6 +208,8 @@ def validate_action(data: dict, allow_multi: bool = True) -> list[str]:
     if isinstance(updates, dict):
         for key, value in updates.items():
             if key not in ("work_start", "work_end", "sleep_start", "sleep_end"):
+                continue
+            if value is None:  # null = удалить ключ
                 continue
             if isinstance(value, list):
                 errors.extend(_validate_conditional_value(key, value))

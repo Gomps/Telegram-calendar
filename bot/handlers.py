@@ -4,12 +4,14 @@
 workflow_data диспетчера (см. main.py).
 """
 
+import asyncio
 import html as html_lib
 import json
 import logging
 import os
 import re
 import tempfile
+from collections import defaultdict
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -36,6 +38,16 @@ from .transcribe import Transcriber, TranscriptionError
 
 log = logging.getLogger(__name__)
 router = Router()
+
+# Очередь на пользователя: сообщения одного пользователя обрабатываются строго
+# по порядку (второе ждёт первое), разные пользователи — параллельно.
+# Whisper дополнительно сериализован внутри Transcriber (модель не потокобезопасна),
+# запросы к Ollama разных пользователей идут одновременно.
+_user_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+def _is_admin(user_id: int, cfg: Config) -> bool:
+    return user_id in cfg.admin_ids
 
 HELP_TEXT = (
     "Я — бот умных напоминаний. Пиши (или наговаривай голосом) обычным языком:\n\n"
@@ -301,7 +313,37 @@ async def cmd_context(message: Message, db: Database, cfg: Config) -> None:
         )
         return
     lines = [f"• {context_label(k)}: {fmt_context_value(v)}" for k, v in sorted(ctx.items())]
-    await message.answer("📋 Твой распорядок:\n" + "\n".join(lines) + clock)
+    buttons = [
+        [InlineKeyboardButton(text=f"🗑 {context_label(k)}", callback_data=f"ctxdel:{k}"[:64])]
+        for k in sorted(ctx)
+    ]
+    await message.answer(
+        "📋 Твой распорядок:\n" + "\n".join(lines) + clock
+        + "\n\nИзменить значение — просто напиши новое («теперь работаю до 17»), "
+        "удалить — кнопкой ниже.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("ctxdel:"))
+async def cb_context_delete(callback: CallbackQuery, db: Database) -> None:
+    key = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    _, ctx = await db.get_user_tz_and_context(user_id)
+    if key not in ctx:
+        await callback.answer("Уже удалено")
+        return
+    await db.update_context(user_id, {key: None})
+    log.info("Пользователь %d удалил ключ контекста «%s»", user_id, key)
+    await callback.answer("Удалено ✅")
+    if callback.message:
+        try:
+            await callback.message.edit_text(
+                f"🗑 Удалено из распорядка: {context_label(key)}.\n"
+                "Посмотреть остальное — /context"
+            )
+        except Exception:
+            log.debug("Не удалось отредактировать сообщение контекста", exc_info=True)
 
 
 @router.message(Command("timezone"))
@@ -487,39 +529,42 @@ async def on_voice(
     transcriber: Transcriber,
     cfg: Config,
 ) -> None:
-    status = StatusMessage(message)
-    await status.set("⏳ Этап 1/3: распознаю голосовое сообщение…")
-    tmp_path = None
-    try:
-        file = await bot.get_file(message.voice.file_id)
-        fd, tmp_path = tempfile.mkstemp(suffix=".ogg")
-        os.close(fd)
-        await bot.download_file(file.file_path, destination=tmp_path)
-        text = await transcriber.transcribe(tmp_path)
-    except TranscriptionError as e:
-        log.warning("Транскрибация не удалась: %s", e)
-        await status.finish(f"😔 Не удалось распознать голосовое сообщение: {e}")
-        return
-    except Exception:
-        log.exception("Ошибка обработки голосового сообщения")
-        await status.finish("😔 Не удалось обработать голосовое сообщение.")
-        return
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                # Windows: файл может быть ещё занят (антивирус/индексатор)
-                log.debug("Не удалось удалить временный файл %s", tmp_path, exc_info=True)
-    await process_text(message, text, db, llm, cfg, bot, status, prefix=f"🎙 «{text}»\n\n")
+    async with _user_locks[message.from_user.id]:
+        status = StatusMessage(message)
+        await status.set("⏳ Этап 1/3: распознаю голосовое сообщение…")
+        tmp_path = None
+        try:
+            file = await bot.get_file(message.voice.file_id)
+            fd, tmp_path = tempfile.mkstemp(suffix=".ogg")
+            os.close(fd)
+            await bot.download_file(file.file_path, destination=tmp_path)
+            text = await transcriber.transcribe(tmp_path)
+        except TranscriptionError as e:
+            log.warning("Транскрибация не удалась: %s", e)
+            detail = f"\n({e})" if _is_admin(message.from_user.id, cfg) else ""
+            await status.finish(f"😔 Ошибка распознавания речи: {e.public}.{detail}")
+            return
+        except Exception:
+            log.exception("Ошибка обработки голосового сообщения")
+            await status.finish("😔 Ошибка распознавания речи: внутренняя ошибка.")
+            return
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    # Windows: файл может быть ещё занят (антивирус/индексатор)
+                    log.debug("Не удалось удалить временный файл %s", tmp_path, exc_info=True)
+        await process_text(message, text, db, llm, cfg, bot, status, prefix=f"🎙 «{text}»\n\n")
 
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(
     message: Message, bot: Bot, db: Database, llm: OllamaClient, cfg: Config
 ) -> None:
-    status = StatusMessage(message)
-    await process_text(message, message.text, db, llm, cfg, bot, status)
+    async with _user_locks[message.from_user.id]:
+        status = StatusMessage(message)
+        await process_text(message, message.text, db, llm, cfg, bot, status)
 
 
 @router.message()
@@ -628,11 +673,13 @@ async def process_text(
     сообщения на результирующий ответ — бот никогда не молчит."""
     try:
         await _process_text(message, text, db, llm, cfg, bot, status, prefix, depth=0)
-    except Exception:
+    except Exception as e:
         log.exception("Необработанная ошибка конвейера (пользователь %d)", message.from_user.id)
+        detail = (
+            f" ({type(e).__name__}: {e})" if _is_admin(message.from_user.id, cfg) else ""
+        )
         await status.finish(
-            prefix + "⚠️ Внутренняя ошибка при обработке сообщения. "
-            "Попробуй ещё раз; подробности — в логах бота."
+            prefix + f"⚠️ Ошибка обработки сообщения: внутренняя ошибка.{detail} Попробуй ещё раз."
         )
 
 
@@ -659,16 +706,21 @@ async def _process_text(
         action = await llm.parse_message(system_prompt, text)
     except LLMUnavailable as e:
         log.error("Ollama недоступна: %s", e)
-        await status.finish(
-            prefix + "⚠️ Языковая модель сейчас недоступна (Ollama не отвечает). "
-            "Проверь, что Ollama запущена и модель скачана, и повтори сообщение."
-        )
+        if _is_admin(user_id, cfg):
+            msg = (
+                "⚠️ Ошибка обработки: языковая модель недоступна (Ollama не отвечает). "
+                f"({e}) Проверь, что Ollama запущена и модель скачана."
+            )
+        else:
+            msg = "⚠️ Ошибка обработки: сервис временно недоступен. Повтори сообщение позже."
+        await status.finish(prefix + msg)
         return
     except LLMBadResponse as e:
         log.error("LLM не вернула валидный JSON: %s", e)
+        detail = f"\n({e})" if _is_admin(user_id, cfg) else ""
         await status.finish(
             prefix + "😕 Не смог разобрать запрос. Попробуй сформулировать иначе — "
-            "например, укажи время с двоеточием: «в 16:30»."
+            f"например, укажи время с двоеточием: «в 16:30».{detail}"
         )
         return
 
@@ -732,7 +784,10 @@ async def _process_text(
         if pending and depth == 0:
             # Ответ на уточнение сохранён — возвращаемся к исходному запросу,
             # иначе он терялся бы («запомнил», а напоминание не создал)
-            saved_note = "; ".join(f"{k}: {v}" for k, v in updates.items())
+            saved_note = "; ".join(
+                f"{context_label(k)}: {'удалено' if v is None else fmt_context_value(v)}"
+                for k, v in updates.items()
+            )
             new_prefix = prefix + (f"💾 Запомнил: {saved_note}\n\n" if saved_note else "")
             await status.set(new_prefix + "⏳ Возвращаюсь к исходному запросу…")
             log.info("Пользователь %d: возврат к исходному запросу «%s»",
@@ -742,7 +797,10 @@ async def _process_text(
                 status, new_prefix, depth=1,
             )
             return
-        lines = [f"• {k}: {v}" for k, v in updates.items()]
+        lines = [
+            f"• {context_label(k)}: {'удалено 🗑' if v is None else fmt_context_value(v)}"
+            for k, v in updates.items()
+        ]
         await status.finish(prefix + "✅ Запомнил:\n" + "\n".join(lines))
         return
 

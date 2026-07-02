@@ -14,7 +14,11 @@ log = logging.getLogger(__name__)
 
 
 class TranscriptionError(Exception):
-    pass
+    """detail — для логов/админа; public — короткая категория для пользователя."""
+
+    def __init__(self, detail: str, public: str = "ошибка сервиса"):
+        super().__init__(detail)
+        self.public = public
 
 
 class Transcriber:
@@ -22,6 +26,9 @@ class Transcriber:
         self.model_name = model_name
         self._model = None
         self._lock = asyncio.Lock()
+        # Модель Whisper не потокобезопасна — распознавания выполняются
+        # по одному (сообщения разных пользователей ждут очереди только здесь)
+        self._infer_lock = asyncio.Lock()
 
     async def _get_model(self):
         async with self._lock:
@@ -31,7 +38,9 @@ class Transcriber:
                     import whisper  # noqa: PLC0415 — тяжёлый импорт откладываем до первого использования
                     self._model = await asyncio.to_thread(whisper.load_model, self.model_name)
                 except Exception as e:
-                    raise TranscriptionError(f"Не удалось загрузить Whisper: {e}") from e
+                    raise TranscriptionError(
+                        f"Не удалось загрузить Whisper: {e}", public="сервис недоступен"
+                    ) from e
                 log.info("Whisper «%s» загружен", self.model_name)
         return self._model
 
@@ -40,16 +49,18 @@ class Transcriber:
         if shutil.which("ffmpeg") is None:
             raise TranscriptionError(
                 "ffmpeg не найден в PATH. Установи его и перезапусти бота "
-                "(Windows: winget install Gyan.FFmpeg; Linux: sudo apt install ffmpeg)"
+                "(Windows: winget install Gyan.FFmpeg; Linux: sudo apt install ffmpeg)",
+                public="сервис не настроен",
             )
         model = await self._get_model()
-        try:
-            result = await asyncio.to_thread(
-                model.transcribe, path, language=language, fp16=False
-            )
-        except Exception as e:
-            raise TranscriptionError(f"Ошибка распознавания: {e}") from e
+        async with self._infer_lock:
+            try:
+                result = await asyncio.to_thread(
+                    model.transcribe, path, language=language, fp16=False
+                )
+            except Exception as e:
+                raise TranscriptionError(f"Ошибка распознавания: {e}") from e
         text = str(result.get("text", "")).strip()
         if not text:
-            raise TranscriptionError("Речь не распознана (пустой результат)")
+            raise TranscriptionError("Речь не распознана (пустой результат)", public="пустое сообщение")
         return text

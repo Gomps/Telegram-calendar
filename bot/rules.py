@@ -114,23 +114,35 @@ def occurrences_for_day(rule: dict, ctx: dict, day: date, tz: ZoneInfo) -> list[
         return []
 
     rtype = rule.get("type")
+    occs: list[datetime] = []
     if rtype in ("daily", "weekly"):
         t = parse_hhmm(rule.get("time", ""))
-        return [datetime.combine(day, t, tzinfo=tz)] if t else []
-
-    if rtype == "interval":
+        if t:
+            occs = [datetime.combine(day, t, tzinfo=tz)]
+    elif rtype == "interval":
         start = resolve_anchor(rule.get("start_anchor", {}), ctx, day, tz)
         end = resolve_anchor(rule.get("end_anchor", {}), ctx, day, tz)
         step = int(rule.get("interval_minutes", 0) or 0)
-        if start is None or end is None or step <= 0 or end < start:
-            return []
-        out, cur = [], start
-        while cur <= end:
-            out.append(cur)
-            cur += timedelta(minutes=step)
-        return out
+        if start is not None and end is not None and step > 0 and end >= start:
+            cur = start
+            while cur <= end:
+                occs.append(cur)
+                cur += timedelta(minutes=step)
 
-    return []
+    # окна исключения («но не в обеденное время»): срабатывания внутри
+    # любого окна отбрасываются
+    exclude = rule.get("exclude") or []
+    if occs and exclude:
+        windows = []
+        for win in exclude:
+            if not isinstance(win, dict):
+                continue
+            ws = resolve_anchor(win.get("start_anchor", {}), ctx, day, tz)
+            we = resolve_anchor(win.get("end_anchor", {}), ctx, day, tz)
+            if ws is not None and we is not None:
+                windows.append((ws, we))
+        occs = [o for o in occs if not any(ws <= o <= we for ws, we in windows)]
+    return occs
 
 
 def next_occurrence(
@@ -176,6 +188,18 @@ def validate_rule(rule: dict) -> list[str]:
             errors.append("interval_minutes должен быть положительным числом")
         for name in ("start_anchor", "end_anchor"):
             errors.extend(_validate_anchor(rule.get(name), name))
+
+    exclude = rule.get("exclude")
+    if exclude is not None:
+        if not isinstance(exclude, list):
+            errors.append("exclude должен быть списком окон {start_anchor, end_anchor}")
+        else:
+            for i, win in enumerate(exclude):
+                if not isinstance(win, dict):
+                    errors.append(f"exclude[{i}] должен быть объектом")
+                    continue
+                errors.extend(_validate_anchor(win.get("start_anchor"), f"exclude[{i}].start_anchor"))
+                errors.extend(_validate_anchor(win.get("end_anchor"), f"exclude[{i}].end_anchor"))
     return errors
 
 
@@ -208,11 +232,14 @@ def context_time_usable(ctx: dict, key: str) -> bool:
 def missing_context_keys(rule: dict, ctx: dict) -> list[str]:
     """Ключи контекста, на которые ссылается правило, но которых нет / они не HH:MM."""
     missing = []
-    for name in ("start_anchor", "end_anchor"):
-        anchor = rule.get(name)
+    anchors = [rule.get("start_anchor"), rule.get("end_anchor")]
+    for win in rule.get("exclude") or []:
+        if isinstance(win, dict):
+            anchors += [win.get("start_anchor"), win.get("end_anchor")]
+    for anchor in anchors:
         if isinstance(anchor, dict) and anchor.get("kind") == "context":
             key = anchor.get("key", "")
-            if not context_time_usable(ctx, key):
+            if not context_time_usable(ctx, key) and key not in missing:
                 missing.append(key)
     return missing
 
@@ -267,4 +294,10 @@ def describe_rule(rule: dict, ctx: dict) -> str:
     end = describe_anchor(rule.get("end_anchor", {}), ctx)
     step = int(rule.get("interval_minutes", 0) or 0)
     step_s = f"каждые {step} мин" if step % 60 else (f"каждый час" if step == 60 else f"каждые {step // 60} ч")
-    return f"{days_s}, с {start} до {end}, {step_s}"
+    text = f"{days_s}, с {start} до {end}, {step_s}"
+    for win in rule.get("exclude") or []:
+        if isinstance(win, dict):
+            ws = describe_anchor(win.get("start_anchor", {}), ctx)
+            we = describe_anchor(win.get("end_anchor", {}), ctx)
+            text += f", кроме {ws} – {we}"
+    return text
