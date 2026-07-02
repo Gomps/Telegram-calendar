@@ -264,15 +264,10 @@ async def cmd_timezone(message: Message, db: Database, cfg: Config) -> None:
     await message.answer(f"✅ Часовой пояс: {tz_name}")
 
 
-@router.message(Command("list"))
-async def cmd_list(message: Message, db: Database, cfg: Config) -> None:
-    user = await db.get_or_create_user(message.from_user.id, message.chat.id, cfg.default_tz)
-    tz = ZoneInfo(user["timezone"])
-    reminders = await db.list_pending_reminders(message.from_user.id)
-    series = await db.list_user_series(message.from_user.id)
+def render_list(user: dict, reminders: list[dict], series: list[dict], tz: ZoneInfo) -> str:
+    """Текст /list. Ошибка описания одной серии не прячет остальные."""
     if not reminders and not series:
-        await message.answer("Активных напоминаний нет.")
-        return
+        return "Активных напоминаний нет."
     lines = []
     if reminders:
         lines.append("🔔 Разовые:")
@@ -283,11 +278,28 @@ async def cmd_list(message: Message, db: Database, cfg: Config) -> None:
         lines.append("🔁 Периодические:")
         now = datetime.now(timezone.utc)
         for s in series:
-            desc = describe_rule(s["rule"], user["context"])
-            nxt = next_occurrence(s["rule"], user["context"], now, tz)
-            nxt_s = f", ближайшее: {fmt_local(nxt.astimezone(timezone.utc), tz)}" if nxt else ""
-            lines.append(f"  S{s['id']} · {s['text']} ({desc}{nxt_s})")
-    await message.answer("\n".join(lines))
+            try:
+                desc = describe_rule(s["rule"], user["context"])
+                nxt = next_occurrence(s["rule"], user["context"], now, tz)
+                nxt_s = f", ближайшее: {fmt_local(nxt.astimezone(timezone.utc), tz)}" if nxt else ""
+                lines.append(f"  S{s['id']} · {s['text']} ({desc}{nxt_s})")
+            except Exception:
+                log.exception("Не удалось описать серию #%s (правило: %s)", s.get("id"), s.get("rule"))
+                lines.append(f"  S{s['id']} · {s['text']} (⚠️ правило не читается — удали через /delete)")
+    return "\n".join(lines)
+
+
+@router.message(Command("list"))
+async def cmd_list(message: Message, db: Database, cfg: Config) -> None:
+    user = await db.get_or_create_user(message.from_user.id, message.chat.id, cfg.default_tz)
+    tz = ZoneInfo(user["timezone"])
+    reminders = await db.list_pending_reminders(message.from_user.id)
+    series = await db.list_user_series(message.from_user.id)
+    log.info(
+        "/list пользователя %d: %d разовых, %d активных серий",
+        message.from_user.id, len(reminders), len(series),
+    )
+    await message.answer(render_list(user, reminders, series, tz))
 
 
 @router.message(Command("delete"))
