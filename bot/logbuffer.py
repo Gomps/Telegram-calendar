@@ -7,6 +7,7 @@
 """
 
 import logging
+import os
 from collections import deque
 
 # Максимум символов лога на страницу (плюс заголовок и <pre> — с запасом до 4096)
@@ -23,6 +24,23 @@ class MemoryLogHandler(logging.Handler):
             self.records.append(self.format(record))
         except Exception:  # логирование не должно ронять бота
             pass
+
+    def seed_from_file(self, path: str, tail_bytes: int = 256 * 1024) -> int:
+        """Наполняет буфер хвостом лог-файла, чтобы /log видел историю
+        и после перезапуска бота. Возвращает число загруженных строк."""
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - tail_bytes))
+                data = f.read().decode("utf-8", errors="replace")
+        except OSError:
+            return 0
+        lines = [line for line in data.splitlines() if line.strip()]
+        if size > tail_bytes and lines:
+            lines = lines[1:]  # первая строка может быть обрезана посередине
+        self.records.extend(lines)
+        return len(lines)
 
 
 def build_pages(records) -> list[str]:

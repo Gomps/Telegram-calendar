@@ -33,6 +33,8 @@ class Config:
     whisper_model: str
     default_tz: str
     db_path: str
+    # Файл логов с ротацией; пустая строка — писать только в stdout
+    log_file: str
     poll_interval: int
     llm_retries: int
     # Насколько поздно (сек) напоминание ещё считается «вовремя», а не просроченным
@@ -56,6 +58,7 @@ def load_config() -> Config:
         whisper_model=os.getenv("WHISPER_MODEL", "medium"),
         default_tz=os.getenv("DEFAULT_TZ", "Europe/Minsk"),
         db_path=os.getenv("DB_PATH", "data/bot.db"),
+        log_file=os.getenv("LOG_FILE", "data/bot.log").strip(),
         poll_interval=int(os.getenv("POLL_INTERVAL", "15")),
         llm_retries=int(os.getenv("LLM_RETRIES", "3")),
         overdue_threshold=int(os.getenv("OVERDUE_THRESHOLD", "120")),

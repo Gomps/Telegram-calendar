@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import logging.handlers
 import os
 
 from aiogram import Bot, Dispatcher
@@ -21,12 +22,25 @@ log = logging.getLogger(__name__)
 async def main() -> None:
     log_format = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
     logging.basicConfig(level=logging.INFO, format=log_format)
+
+    cfg = load_config()
+
     # Кольцевой буфер последних записей — отдаётся администратору командой /log
     logbuffer = MemoryLogHandler(capacity=1000)
     logbuffer.setFormatter(logging.Formatter(log_format, datefmt="%d.%m %H:%M:%S"))
-    logging.getLogger().addHandler(logbuffer)
 
-    cfg = load_config()
+    if cfg.log_file:
+        os.makedirs(os.path.dirname(cfg.log_file) or ".", exist_ok=True)
+        # история из файла доступна в /log сразу после перезапуска
+        seeded = logbuffer.seed_from_file(cfg.log_file)
+        file_handler = logging.handlers.RotatingFileHandler(
+            cfg.log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        )
+        file_handler.setFormatter(logging.Formatter(log_format))
+        logging.getLogger().addHandler(file_handler)
+        log.info("Логи пишутся в %s (загружено %d строк истории)", cfg.log_file, seeded)
+
+    logging.getLogger().addHandler(logbuffer)
 
     os.makedirs(os.path.dirname(cfg.db_path) or ".", exist_ok=True)
     db = Database(cfg.db_path)
