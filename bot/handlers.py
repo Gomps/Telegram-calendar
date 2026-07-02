@@ -8,6 +8,7 @@ import html as html_lib
 import json
 import logging
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -380,6 +381,23 @@ async def on_other(message: Message) -> None:
 
 # --- основной конвейер -------------------------------------------------------
 
+# Явные признаки периодичности в тексте — для сверки классификации LLM
+PERIODIC_RE = re.compile(
+    r"\b(кажд\w+|ежедневн\w*|еженедельн\w*|ежемесячн\w*|ежечасн\w*|раз\s+в\b|"
+    r"по\s+будням|по\s+выходным|"
+    r"по\s+(понедельник|вторник|сред|четверг|пятниц|суббот|воскресень)\w*)"
+)
+
+
+async def _corrective_retry(
+    llm: OllamaClient, system_prompt: str, hint: str, text: str
+) -> dict | None:
+    """Один повторный запрос к LLM с подсказкой; None — не получилось."""
+    try:
+        return await llm.parse_message(system_prompt + hint, text)
+    except (LLMUnavailable, LLMBadResponse):
+        return None
+
 
 async def process_text(
     message: Message,
@@ -440,6 +458,31 @@ async def _process_text(
         return
 
     log.info("Пользователь %d: action=%s", user_id, action.get("action"))
+    kind = action["action"]
+
+    # Сверка классификации: признаки периодичности в тексте против типа
+    # действия — модель путает «через 5 минут» с серией и наоборот
+    if depth == 0 and kind in ("create_reminder", "create_recurring"):
+        periodic = PERIODIC_RE.search(text.lower().replace("ё", "е")) is not None
+        hint = None
+        if kind == "create_recurring" and not periodic:
+            hint = (
+                "\n\nВАЖНО: в сообщении НЕТ признаков периодичности («каждый», «ежедневно», "
+                "«по понедельникам», «раз в…»). Это РАЗОВОЕ напоминание — верни create_reminder."
+            )
+        elif kind == "create_reminder" and periodic:
+            hint = (
+                "\n\nВАЖНО: в сообщении ЕСТЬ признак периодичности. Вероятно, нужен "
+                "create_recurring или multi (разовое + серия), см. правило 12."
+            )
+        if hint:
+            log.info("Классификация «%s» не согласуется с текстом — корректирующий повтор", kind)
+            await status.set(prefix + "⏳ Этап 2/3: перепроверяю разбор…")
+            corrected = await _corrective_retry(llm, system_prompt, hint, text)
+            if corrected is not None:
+                action, kind = corrected, corrected["action"]
+                log.info("Пользователь %d: action после сверки=%s", user_id, kind)
+
     await status.set(prefix + "⏳ Этап 3/3: сохраняю…")
 
     # Новые факты о распорядке применяем при любом действии
@@ -448,8 +491,6 @@ async def _process_text(
     if updates:
         ctx = await db.update_context(user_id, updates)
         log.info("Пользователь %d: контекст обновлён %s", user_id, updates)
-
-    kind = action["action"]
 
     # Модель переспрашивает то, что уже есть в контексте, — один
     # корректирующий повтор с явной подсказкой
@@ -463,15 +504,13 @@ async def _process_text(
                 + json.dumps(known, ensure_ascii=False)
                 + ". Не задавай уточняющий вопрос — выполни запрос, используя эти значения."
             )
-            try:
-                action = await llm.parse_message(system_prompt + hint, text)
-                kind = action["action"]
-                new_updates = action.get("context_updates") or {}
+            corrected = await _corrective_retry(llm, system_prompt, hint, text)
+            if corrected is not None:
+                action, kind = corrected, corrected["action"]
+                new_updates = corrected.get("context_updates") or {}
                 if new_updates:
                     ctx = await db.update_context(user_id, new_updates)
                     updates = {**updates, **new_updates}
-            except (LLMUnavailable, LLMBadResponse):
-                pass  # остаёмся с исходным уточняющим вопросом
 
     if kind == "save_context":
         await db.clear_pending_clarification(user_id)
@@ -493,11 +532,50 @@ async def _process_text(
         return
 
     if kind == "create_reminder":
-        await handle_create_reminder(action, user, ctx, tz, db, status, prefix, text)
+        msg, _stop, _fire = await _do_create_reminder(action, user, ctx, tz, db, text)
+        await status.finish(prefix + msg)
         return
 
     if kind == "create_recurring":
-        await handle_create_recurring(action, user, ctx, tz, db, text, status, prefix)
+        msg, _stop = await _do_create_recurring(action, user, ctx, tz, db, text)
+        await status.finish(prefix + msg)
+        return
+
+    if kind == "multi":
+        # Комбинированный запрос («напомни через час, а потом каждый день»):
+        # выполняем действия по очереди, ответы склеиваем в одно сообщение
+        parts: list[str] = []
+        last_fire_utc = None
+        for sub in action.get("actions", []):
+            sub_updates = sub.get("context_updates") or {}
+            if sub_updates:
+                ctx = await db.update_context(user_id, sub_updates)
+                log.info("Пользователь %d: контекст обновлён %s", user_id, sub_updates)
+            skind = sub.get("action")
+            if skind == "save_context" and sub_updates:
+                parts.append(
+                    "✅ Запомнил: " + "; ".join(f"{k}: {v}" for k, v in sub_updates.items())
+                )
+            elif skind == "create_reminder":
+                msg, stop, fire_utc = await _do_create_reminder(sub, user, ctx, tz, db, text)
+                parts.append(msg)
+                if fire_utc is not None:
+                    last_fire_utc = fire_utc
+                if stop:
+                    break
+            elif skind == "create_recurring":
+                # серия не должна дублировать только что созданное разовое —
+                # её отсчёт начинается после него
+                msg, stop = await _do_create_recurring(
+                    sub, user, ctx, tz, db, text, skip_until=last_fire_utc
+                )
+                parts.append(msg)
+                if stop:
+                    break
+        await status.finish(
+            prefix
+            + ("\n\n".join(parts) if parts else "Не понял запрос — попробуй сформулировать иначе.")
+        )
         return
 
     if kind == "ask_clarification":
@@ -520,10 +598,13 @@ async def _process_text(
     )
 
 
-async def handle_create_reminder(
-    action: dict, user: dict, ctx: dict, tz: ZoneInfo, db: Database,
-    status: StatusMessage, prefix: str, raw_text: str,
-) -> None:
+async def _do_create_reminder(
+    action: dict, user: dict, ctx: dict, tz: ZoneInfo, db: Database, raw_text: str
+) -> tuple[str, bool, datetime | None]:
+    """Создаёт разовое напоминание.
+
+    Возвращает (текст ответа, прервать_ли_дальнейшую_обработку, время UTC).
+    """
     now_local = datetime.now(timezone.utc).astimezone(tz)
 
     # Этап «время»: сначала детерминированный парсер по дословному выражению
@@ -546,30 +627,38 @@ async def handle_create_reminder(
             "Укажи время, например «в 16:30» или «через 20 минут»."
         )
         await db.set_pending_clarification(user["user_id"], raw_text, question)
-        await status.finish(prefix + "❓ " + question)
-        return
+        return "❓ " + question, True, None
 
     fire_utc = fire_local.astimezone(timezone.utc)
     if fire_utc <= datetime.now(timezone.utc):
-        await status.finish(
-            prefix + f"Похоже, это время уже прошло ({fire_local.strftime('%d.%m.%Y %H:%M')}). "
-            "Уточни, когда напомнить?"
+        return (
+            f"Похоже, это время уже прошло ({fire_local.strftime('%d.%m.%Y %H:%M')}). "
+            "Уточни, когда напомнить?",
+            True,
+            None,
         )
-        return
     reminder_id = await db.add_reminder(
         user["user_id"], user["chat_id"], action["reminder_text"].strip(), fire_utc
     )
     await db.clear_pending_clarification(user["user_id"])
     log.info("Создано напоминание #%d на %s", reminder_id, fire_utc)
-    await status.finish(
-        prefix + f"✅ Напомню: «{action['reminder_text'].strip()}»\n🕐 {fmt_local(fire_utc, tz)}"
+    return (
+        f"✅ Напомню: «{action['reminder_text'].strip()}»\n🕐 {fmt_local(fire_utc, tz)}",
+        False,
+        fire_utc,
     )
 
 
-async def handle_create_recurring(
+async def _do_create_recurring(
     action: dict, user: dict, ctx: dict, tz: ZoneInfo, db: Database, raw_text: str,
-    status: StatusMessage, prefix: str,
-) -> None:
+    skip_until: datetime | None = None,
+) -> tuple[str, bool]:
+    """Создаёт периодическую серию.
+
+    skip_until — не срабатывать до этого момента (UTC): в multi серия не
+    должна дублировать только что созданное разовое напоминание.
+    Возвращает (текст ответа, прервать_ли_дальнейшую_обработку).
+    """
     rule = action["recurring"]
     # Правило ссылается на распорядок, которого нет, — доспрашиваем, а не создаём пустышку
     missing = missing_context_keys(rule, ctx)
@@ -582,19 +671,22 @@ async def handle_create_recurring(
         }
         question = questions.get(missing[0], f"Уточни время «{missing[0]}» (HH:MM)?")
         await db.set_pending_clarification(user["user_id"], raw_text, question)
-        await status.finish(prefix + "❓ " + question)
-        return
+        return "❓ " + question, True
 
     series_id = await db.add_series(
         user["user_id"], user["chat_id"], action["reminder_text"].strip(), rule
     )
+    if skip_until is not None:
+        await db.set_series_cursor(series_id, skip_until)
     await db.clear_pending_clarification(user["user_id"])
     log.info("Создана серия #%d: %s", series_id, rule)
 
-    nxt = next_occurrence(rule, ctx, datetime.now(timezone.utc), tz)
+    after = max(datetime.now(timezone.utc), skip_until or datetime.min.replace(tzinfo=timezone.utc))
+    nxt = next_occurrence(rule, ctx, after, tz)
     nxt_s = f"\n🕐 Ближайшее: {fmt_local(nxt.astimezone(timezone.utc), tz)}" if nxt else ""
-    await status.finish(
-        prefix + f"✅ Серия создана: «{action['reminder_text'].strip()}»\n"
+    return (
+        f"✅ Серия создана: «{action['reminder_text'].strip()}»\n"
         f"📅 {describe_rule(rule, ctx)}{nxt_s}\n"
-        "При изменении распорядка расписание пересчитается автоматически."
+        "При изменении распорядка расписание пересчитается автоматически.",
+        False,
     )

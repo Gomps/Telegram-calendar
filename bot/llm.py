@@ -60,6 +60,11 @@ def normalize_action(data: dict) -> dict:
     Модель нередко повторяет формат пользователя («16.30», «7» вместо «16:30»,
     «07:00») — не отбрасываем такой ответ, а чиним детерминированно.
     """
+    if data.get("action") == "multi" and isinstance(data.get("actions"), list):
+        for sub in data["actions"]:
+            if isinstance(sub, dict):
+                normalize_action(sub)
+
     updates = data.get("context_updates")
     if isinstance(updates, dict):
         for key, value in list(updates.items()):
@@ -97,12 +102,32 @@ def normalize_action(data: dict) -> dict:
     return data
 
 
-def validate_action(data: dict) -> list[str]:
+def validate_action(data: dict, allow_multi: bool = True) -> list[str]:
     """Проверяет ответ модели по схеме; возвращает список ошибок."""
     errors: list[str] = []
     action = data.get("action")
+
+    if action == "multi":
+        if not allow_multi:
+            return ["multi внутри multi запрещён"]
+        subs = data.get("actions")
+        if not isinstance(subs, list) or not subs:
+            return ["для multi нужен непустой список actions"]
+        for i, sub in enumerate(subs):
+            if not isinstance(sub, dict):
+                errors.append(f"actions[{i}] должен быть объектом")
+                continue
+            if sub.get("action") in ("multi", "ask_clarification"):
+                errors.append(
+                    f"actions[{i}]: {sub.get('action')} внутри multi запрещён — "
+                    "если нужен уточняющий вопрос, верни один ask_clarification вместо multi"
+                )
+                continue
+            errors.extend(f"actions[{i}]: {e}" for e in validate_action(sub, allow_multi=False))
+        return errors
+
     if action not in ACTIONS:
-        return [f"action должен быть одним из {sorted(ACTIONS)}"]
+        return [f"action должен быть одним из {sorted(ACTIONS | {'multi'})}"]
 
     updates = data.get("context_updates")
     if updates is not None and not isinstance(updates, dict):
