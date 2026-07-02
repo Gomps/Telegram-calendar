@@ -4,6 +4,7 @@
 workflow_data диспетчера (см. main.py).
 """
 
+import html as html_lib
 import logging
 import os
 import tempfile
@@ -17,6 +18,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from .config import Config
 from .db import Database
 from .llm import LLMBadResponse, LLMUnavailable, OllamaClient
+from .logbuffer import MemoryLogHandler, build_pages
 from .prompts import build_system_prompt
 from .rules import describe_rule, missing_context_keys, next_occurrence
 from .transcribe import Transcriber, TranscriptionError
@@ -36,7 +38,8 @@ HELP_TEXT = (
     "/context — сохранённый распорядок\n"
     "/timezone Europe/Minsk — сменить часовой пояс\n"
     "/id — узнать свой Telegram ID\n\n"
-    "Администратору: /adduser <id>, /removeuser <id>, /users — управление доступом"
+    "Администратору: /adduser <id>, /removeuser <id>, /users — управление доступом, "
+    "/log — логи бота"
 )
 
 
@@ -153,6 +156,64 @@ async def cmd_users(message: Message, db: Database, cfg: Config) -> None:
 @router.message(Command("id"))
 async def cmd_id(message: Message) -> None:
     await message.answer(f"Твой Telegram ID: `{message.from_user.id}`", parse_mode="Markdown")
+
+
+# --- просмотр логов бота (только админ) ---------------------------------------
+
+
+def _render_log_page(logbuffer: MemoryLogHandler, page: int):
+    """(текст, клавиатура) для страницы логов; None — логов нет.
+
+    Страницы хронологические: последняя — самые свежие записи. Стрелка «⬅️»
+    (старее) и «➡️» (новее) показываются только когда есть куда листать.
+    """
+    pages = build_pages(logbuffer.records)
+    if not pages:
+        return None
+    page = max(0, min(page, len(pages) - 1))
+    text = (
+        f"📋 Логи бота — стр. {page + 1}/{len(pages)} (свежие в конце)\n"
+        f"<pre>{html_lib.escape(pages[page])}</pre>"
+    )
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton(text="⬅️ старее", callback_data=f"log:{page - 1}"))
+    if page < len(pages) - 1:
+        buttons.append(InlineKeyboardButton(text="новее ➡️", callback_data=f"log:{page + 1}"))
+    markup = InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else None
+    return text, markup
+
+
+@router.message(Command("log"))
+async def cmd_log(message: Message, cfg: Config, logbuffer: MemoryLogHandler) -> None:
+    if message.from_user.id not in cfg.admin_ids:
+        await message.answer("⛔ Команда доступна только администратору.")
+        return
+    view = _render_log_page(logbuffer, page=10**9)  # последняя страница — свежие логи
+    if view is None:
+        await message.answer("Логов пока нет.")
+        return
+    text, markup = view
+    await message.answer(text, reply_markup=markup, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("log:"))
+async def cb_log(callback: CallbackQuery, cfg: Config, logbuffer: MemoryLogHandler) -> None:
+    if callback.from_user.id not in cfg.admin_ids:
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    page = int(callback.data.split(":")[1])
+    view = _render_log_page(logbuffer, page)
+    if view is None:
+        await callback.answer("Логов пока нет")
+        return
+    text, markup = view
+    try:
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        # например, «message is not modified» — просто гасим «часики»
+        log.debug("Не удалось обновить страницу логов", exc_info=True)
+    await callback.answer()
 
 
 # --- команды ---------------------------------------------------------------

@@ -11,6 +11,7 @@ from .config import load_config
 from .db import Database
 from .handlers import router
 from .llm import OllamaClient
+from .logbuffer import MemoryLogHandler
 from .scheduler import ReminderScheduler
 from .transcribe import Transcriber
 
@@ -18,10 +19,13 @@ log = logging.getLogger(__name__)
 
 
 async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-    )
+    log_format = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+    logging.basicConfig(level=logging.INFO, format=log_format)
+    # Кольцевой буфер последних записей — отдаётся администратору командой /log
+    logbuffer = MemoryLogHandler(capacity=1000)
+    logbuffer.setFormatter(logging.Formatter(log_format, datefmt="%d.%m %H:%M:%S"))
+    logging.getLogger().addHandler(logbuffer)
+
     cfg = load_config()
 
     os.makedirs(os.path.dirname(cfg.db_path) or ".", exist_ok=True)
@@ -53,6 +57,7 @@ async def main() -> None:
     dp["llm"] = llm
     dp["transcriber"] = Transcriber(cfg.whisper_model)
     dp["cfg"] = cfg
+    dp["logbuffer"] = logbuffer
 
     # Белый список: если ADMIN_USER_IDS задан, доступ только у админов и добавленных
     dp.message.outer_middleware(AccessMiddleware())
