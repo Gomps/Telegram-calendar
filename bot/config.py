@@ -8,9 +8,26 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _parse_ids(raw: str) -> tuple[int, ...]:
+    ids = []
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part:
+            try:
+                ids.append(int(part))
+            except ValueError:
+                raise RuntimeError(f"Некорректный Telegram ID в конфиге: «{part}»") from None
+    return tuple(ids)
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
+    # Администраторы: управляют белым списком (/adduser, /removeuser, /users).
+    # Если список пуст — бот открыт для всех (доступ не проверяется).
+    admin_ids: tuple[int, ...]
+    # Статический белый список из .env (в дополнение к добавленным через /adduser)
+    allowed_ids: tuple[int, ...]
     ollama_url: str
     ollama_model: str
     whisper_model: str
@@ -32,6 +49,8 @@ def load_config() -> Config:
         )
     return Config(
         bot_token=token,
+        admin_ids=_parse_ids(os.getenv("ADMIN_USER_IDS", "")),
+        allowed_ids=_parse_ids(os.getenv("ALLOWED_USER_IDS", "")),
         ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/"),
         ollama_model=os.getenv("OLLAMA_MODEL", "qwen3.5:4b"),
         whisper_model=os.getenv("WHISPER_MODEL", "medium"),

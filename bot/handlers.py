@@ -34,7 +34,9 @@ HELP_TEXT = (
     "/list — активные напоминания и серии\n"
     "/delete — удалить напоминание или серию\n"
     "/context — сохранённый распорядок\n"
-    "/timezone Europe/Minsk — сменить часовой пояс"
+    "/timezone Europe/Minsk — сменить часовой пояс\n"
+    "/id — узнать свой Telegram ID\n\n"
+    "Администратору: /adduser <id>, /removeuser <id>, /users — управление доступом"
 )
 
 
@@ -42,6 +44,79 @@ def fmt_local(dt_utc: datetime, tz: ZoneInfo) -> str:
     local = dt_utc.astimezone(tz)
     dow = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"][local.weekday()]
     return f"{dow}, {local.strftime('%d.%m.%Y %H:%M')}"
+
+
+# --- администрирование: белый список по ID -----------------------------------
+
+
+def _parse_target_id(message: Message) -> int | None:
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1].strip())
+    except ValueError:
+        return None
+
+
+@router.message(Command("adduser"))
+async def cmd_adduser(message: Message, db: Database, cfg: Config) -> None:
+    if message.from_user.id not in cfg.admin_ids:
+        await message.answer("⛔ Команда доступна только администратору.")
+        return
+    target = _parse_target_id(message)
+    if target is None:
+        await message.answer("Использование: /adduser <telegram_id>\nНапример: /adduser 123456789")
+        return
+    added = await db.add_allowed_user(target, message.from_user.id)
+    log.info("Админ %d добавил пользователя %d в белый список", message.from_user.id, target)
+    await message.answer(
+        f"✅ Пользователь {target} добавлен." if added else f"Пользователь {target} уже в списке."
+    )
+
+
+@router.message(Command("removeuser"))
+async def cmd_removeuser(message: Message, db: Database, cfg: Config) -> None:
+    if message.from_user.id not in cfg.admin_ids:
+        await message.answer("⛔ Команда доступна только администратору.")
+        return
+    target = _parse_target_id(message)
+    if target is None:
+        await message.answer("Использование: /removeuser <telegram_id>")
+        return
+    removed = await db.remove_allowed_user(target)
+    if removed:
+        log.info("Админ %d удалил пользователя %d из белого списка", message.from_user.id, target)
+        await message.answer(f"✅ Пользователь {target} удалён из списка.")
+    elif target in cfg.allowed_ids:
+        await message.answer(
+            f"Пользователь {target} задан в ALLOWED_USER_IDS (.env) — убери его оттуда и перезапусти бота."
+        )
+    else:
+        await message.answer(f"Пользователя {target} нет в списке.")
+
+
+@router.message(Command("users"))
+async def cmd_users(message: Message, db: Database, cfg: Config) -> None:
+    if message.from_user.id not in cfg.admin_ids:
+        await message.answer("⛔ Команда доступна только администратору.")
+        return
+    lines = ["👑 Администраторы (.env):"] + [f"  • {i}" for i in cfg.admin_ids]
+    if cfg.allowed_ids:
+        lines.append("📄 Белый список (.env):")
+        lines += [f"  • {i}" for i in cfg.allowed_ids]
+    dynamic = await db.list_allowed_users()
+    if dynamic:
+        lines.append("➕ Добавлены через /adduser:")
+        lines += [f"  • {u['user_id']} (добавил {u['added_by']})" for u in dynamic]
+    else:
+        lines.append("➕ Через /adduser пока никто не добавлен.")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("id"))
+async def cmd_id(message: Message) -> None:
+    await message.answer(f"Твой Telegram ID: `{message.from_user.id}`", parse_mode="Markdown")
 
 
 # --- команды ---------------------------------------------------------------

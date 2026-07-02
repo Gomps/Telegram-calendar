@@ -45,6 +45,12 @@ CREATE TABLE IF NOT EXISTS series (
     created_at    TEXT    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS allowed_users (
+    user_id    INTEGER PRIMARY KEY,
+    added_by   INTEGER NOT NULL,
+    created_at TEXT    NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS pending_clarifications (
     user_id          INTEGER PRIMARY KEY,
     original_request TEXT NOT NULL,
@@ -211,6 +217,36 @@ class Database:
         )
         await self.db.commit()
         return cur.rowcount > 0
+
+    # --- белый список пользователей ----------------------------------------------
+
+    async def add_allowed_user(self, user_id: int, added_by: int) -> bool:
+        """True — добавлен, False — уже был в списке."""
+        cur = await self.db.execute(
+            "INSERT OR IGNORE INTO allowed_users (user_id, added_by, created_at) VALUES (?, ?, ?)",
+            (user_id, added_by, utcnow_iso()),
+        )
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    async def remove_allowed_user(self, user_id: int) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM allowed_users WHERE user_id = ?", (user_id,)
+        )
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    async def is_user_allowed(self, user_id: int) -> bool:
+        cur = await self.db.execute(
+            "SELECT 1 FROM allowed_users WHERE user_id = ?", (user_id,)
+        )
+        return await cur.fetchone() is not None
+
+    async def list_allowed_users(self) -> list[dict]:
+        cur = await self.db.execute(
+            "SELECT * FROM allowed_users ORDER BY created_at"
+        )
+        return [dict(r) for r in await cur.fetchall()]
 
     # --- незавершённые уточнения -------------------------------------------------
 

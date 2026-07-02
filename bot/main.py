@@ -6,6 +6,7 @@ import os
 
 from aiogram import Bot, Dispatcher
 
+from .access import AccessMiddleware
 from .config import load_config
 from .db import Database
 from .handlers import router
@@ -46,6 +47,17 @@ async def main() -> None:
     dp["llm"] = llm
     dp["transcriber"] = Transcriber(cfg.whisper_model)
     dp["cfg"] = cfg
+
+    # Белый список: если ADMIN_USER_IDS задан, доступ только у админов и добавленных
+    dp.message.outer_middleware(AccessMiddleware())
+    dp.callback_query.outer_middleware(AccessMiddleware())
+    if cfg.admin_ids:
+        log.info(
+            "Контроль доступа включён: админы %s, статический белый список %s",
+            list(cfg.admin_ids), list(cfg.allowed_ids) or "—",
+        )
+    else:
+        log.info("ADMIN_USER_IDS не задан — бот открыт для всех пользователей")
 
     scheduler = ReminderScheduler(bot, db, cfg)
     scheduler.start()
