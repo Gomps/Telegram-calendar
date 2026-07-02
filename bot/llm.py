@@ -71,9 +71,17 @@ def normalize_action(data: dict) -> dict:
     updates = data.get("context_updates")
     if isinstance(updates, dict):
         for key, value in list(updates.items()):
-            norm = normalize_hhmm(value)
-            if norm is not None:
-                updates[key] = norm
+            if isinstance(value, list):
+                # условные значения: [{"value": "16.30", "when": {...}}, ...]
+                for entry in value:
+                    if isinstance(entry, dict):
+                        norm = normalize_hhmm(entry.get("value", ""))
+                        if norm is not None:
+                            entry["value"] = norm
+            else:
+                norm = normalize_hhmm(value)
+                if norm is not None:
+                    updates[key] = norm
 
     rec = data.get("recurring")
     if isinstance(rec, dict):
@@ -197,9 +205,39 @@ def validate_action(data: dict, allow_multi: bool = True) -> list[str]:
 
     if isinstance(updates, dict):
         for key, value in updates.items():
-            if key in ("work_start", "work_end", "sleep_start", "sleep_end") and parse_hhmm(str(value)) is None:
+            if key not in ("work_start", "work_end", "sleep_start", "sleep_end"):
+                continue
+            if isinstance(value, list):
+                errors.extend(_validate_conditional_value(key, value))
+            elif parse_hhmm(str(value)) is None:
                 errors.append(f"context_updates.{key} должен быть в формате HH:MM, получено «{value}»")
 
+    return errors
+
+
+def _validate_conditional_value(key: str, variants: list) -> list[str]:
+    """Проверка условного значения контекста: список вариантов с value/when."""
+    errors = []
+    for i, entry in enumerate(variants):
+        where = f"context_updates.{key}[{i}]"
+        if not isinstance(entry, dict):
+            errors.append(f"{where} должен быть объектом с полями value и when")
+            continue
+        if parse_hhmm(str(entry.get("value", ""))) is None:
+            errors.append(f"{where}.value должен быть в формате HH:MM")
+        when = entry.get("when")
+        if when is not None:
+            if not isinstance(when, dict):
+                errors.append(f"{where}.when должен быть объектом")
+                continue
+            if when.get("day_parity") not in (None, "even", "odd"):
+                errors.append(f"{where}.when.day_parity должен быть even | odd")
+            days = when.get("days_of_week")
+            if days is not None and (
+                not isinstance(days, list)
+                or not all(isinstance(d, int) and 0 <= d <= 6 for d in days)
+            ):
+                errors.append(f"{where}.when.days_of_week — список чисел 0..6")
     return errors
 
 

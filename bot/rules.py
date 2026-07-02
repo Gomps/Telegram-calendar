@@ -52,13 +52,44 @@ def parse_hhmm(value) -> Optional[time]:
     return time(int(hh), int(mm))
 
 
+def when_matches(when: dict, day: date) -> bool:
+    """Проверка условий «when»: чётность числа месяца и дни недели (логическое И)."""
+    if not isinstance(when, dict):
+        return False
+    parity = when.get("day_parity")
+    if parity == "even" and day.day % 2 != 0:
+        return False
+    if parity == "odd" and day.day % 2 != 1:
+        return False
+    days = when.get("days_of_week")
+    if days and day.weekday() not in days:
+        return False
+    return True
+
+
+def resolve_context_value(ctx: dict, key: str, day: date):
+    """Значение ключа контекста для конкретного дня.
+
+    Значение может быть простым («16:30») или списком вариантов с условиями:
+    [{"value": "16:30", "when": {"day_parity": "even"}}, {"value": "18:00"}].
+    Берётся первый вариант, чьё «when» подходит дню (без when = по умолчанию).
+    """
+    raw = ctx.get(key)
+    if isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, dict) and when_matches(entry.get("when") or {}, day):
+                return entry.get("value")
+        return None
+    return raw
+
+
 def resolve_anchor(anchor: dict, ctx: dict, day: date, tz: ZoneInfo) -> Optional[datetime]:
     """Якорь -> конкретный datetime в этот день (aware, локальный TZ). None — нет данных."""
     if not isinstance(anchor, dict):
         return None
     kind = anchor.get("kind")
     if kind == "context":
-        raw = ctx.get(anchor.get("key", ""))
+        raw = resolve_context_value(ctx, anchor.get("key", ""), day)
         if raw is None:
             return None
         t = parse_hhmm(raw)
@@ -75,6 +106,11 @@ def resolve_anchor(anchor: dict, ctx: dict, day: date, tz: ZoneInfo) -> Optional
 def occurrences_for_day(rule: dict, ctx: dict, day: date, tz: ZoneInfo) -> list[datetime]:
     days = rule.get("days_of_week")
     if days and day.weekday() not in days:
+        return []
+    parity = rule.get("day_parity")
+    if parity == "even" and day.day % 2 != 0:
+        return []
+    if parity == "odd" and day.day % 2 != 1:
         return []
 
     rtype = rule.get("type")
@@ -126,6 +162,9 @@ def validate_rule(rule: dict) -> list[str]:
         if not isinstance(days, list) or not all(isinstance(d, int) and 0 <= d <= 6 for d in days):
             errors.append("days_of_week — список чисел 0..6 (0 = понедельник) или null")
 
+    if rule.get("day_parity") not in (None, "even", "odd"):
+        errors.append("day_parity должен быть even | odd или null")
+
     if rtype in ("daily", "weekly"):
         if parse_hhmm(rule.get("time", "")) is None:
             errors.append("для daily/weekly нужно поле time в формате HH:MM")
@@ -155,6 +194,17 @@ def _validate_anchor(anchor, name: str) -> list[str]:
     return []
 
 
+def context_time_usable(ctx: dict, key: str) -> bool:
+    """Есть ли у ключа хотя бы одно пригодное значение-время (простое или в вариантах)."""
+    raw = ctx.get(key)
+    if isinstance(raw, list):
+        return any(
+            isinstance(e, dict) and parse_hhmm(str(e.get("value", ""))) is not None
+            for e in raw
+        )
+    return parse_hhmm(str(raw or "")) is not None
+
+
 def missing_context_keys(rule: dict, ctx: dict) -> list[str]:
     """Ключи контекста, на которые ссылается правило, но которых нет / они не HH:MM."""
     missing = []
@@ -162,7 +212,7 @@ def missing_context_keys(rule: dict, ctx: dict) -> list[str]:
         anchor = rule.get(name)
         if isinstance(anchor, dict) and anchor.get("kind") == "context":
             key = anchor.get("key", "")
-            if parse_hhmm(str(ctx.get(key, ""))) is None:
+            if not context_time_usable(ctx, key):
                 missing.append(key)
     return missing
 
@@ -170,12 +220,30 @@ def missing_context_keys(rule: dict, ctx: dict) -> list[str]:
 DOW_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 
 
+def describe_when(when: dict) -> str:
+    """«when» человеческим языком: «по чётным числам», «по пт», их сочетание."""
+    parts = []
+    days = when.get("days_of_week") if isinstance(when, dict) else None
+    if days:
+        parts.append("по " + ", ".join(DOW_SHORT[d] for d in sorted(days) if 0 <= d <= 6))
+    parity = when.get("day_parity") if isinstance(when, dict) else None
+    if parity == "even":
+        parts.append("по чётным числам")
+    elif parity == "odd":
+        parts.append("по нечётным числам")
+    return ", ".join(parts) if parts else "по умолчанию"
+
+
 def describe_anchor(anchor: dict, ctx: dict) -> str:
     kind = anchor.get("kind")
     off = int(anchor.get("offset_minutes", 0) or 0)
     if kind == "context":
         key = anchor.get("key", "?")
-        base = f"{key} ({ctx.get(key, '—')})"
+        raw = ctx.get(key)
+        if isinstance(raw, list):
+            base = f"{key} (по условиям)"
+        else:
+            base = f"{key} ({raw if raw is not None else '—'})"
     else:
         base = anchor.get("time", "?")
     if off:
@@ -187,6 +255,11 @@ def describe_anchor(anchor: dict, ctx: dict) -> str:
 def describe_rule(rule: dict, ctx: dict) -> str:
     days = rule.get("days_of_week")
     days_s = "ежедневно" if not days else "по " + ", ".join(DOW_SHORT[d] for d in sorted(days))
+    parity = rule.get("day_parity")
+    if parity == "even":
+        days_s += ", по чётным числам"
+    elif parity == "odd":
+        days_s += ", по нечётным числам"
     rtype = rule.get("type")
     if rtype in ("daily", "weekly"):
         return f"{days_s} в {rule.get('time')}"

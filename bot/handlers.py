@@ -22,7 +22,14 @@ from .db import Database
 from .llm import LLMBadResponse, LLMUnavailable, OllamaClient
 from .logbuffer import MemoryLogHandler, build_pages
 from .prompts import build_system_prompt
-from .rules import describe_rule, missing_context_keys, next_occurrence, parse_hhmm
+from .rules import (
+    DOW_SHORT,
+    describe_rule,
+    describe_when,
+    missing_context_keys,
+    next_occurrence,
+    parse_hhmm,
+)
 from .timeparse import has_day_marker, parse_time_expression
 from .tzutil import city_to_tz, get_tz, offset_from_current_time, offset_tz_name
 from .transcribe import Transcriber, TranscriptionError
@@ -34,6 +41,7 @@ HELP_TEXT = (
     "Я — бот умных напоминаний. Пиши (или наговаривай голосом) обычным языком:\n\n"
     "📋 Распорядок:\n"
     "• «Я работаю с 9 до 18, сплю с 23 до 7» — запомню и буду использовать\n"
+    "• «По чётным дням я работаю до 16:30, по нечётным — до 18» — условия в распорядке\n"
     "• «Я из Минска» или «У меня сейчас 16:45» — сам настрою часовой пояс\n\n"
     "🔔 Разовые напоминания:\n"
     "• «Напомни через 5 минут выпить чай», «Сделать зарядку напомни через час»\n"
@@ -43,6 +51,7 @@ HELP_TEXT = (
     "🔁 Периодические:\n"
     "• «Напоминай после работы каждый час пить воду, и так до двух часов до сна»\n"
     "• «Каждый понедельник в 10:00 — планёрка»\n"
+    "• «Принимать витамины по чётным дням в 9:00», «по пятницам по чётным числам»\n"
     "• «Напомни через час полить цветы, а потом каждый день» — разовое + серия\n\n"
     "❓ Условные:\n"
     "• «Если в 11:30 завтра не буду спать — напомни после обеда выпить таблетку» — "
@@ -51,7 +60,7 @@ HELP_TEXT = (
     "/list — активные напоминания и серии\n"
     "/delete — удалить напоминание или серию\n"
     "/context — сохранённый распорядок\n"
-    "/timezone Europe/Minsk — сменить часовой пояс\n"
+    "/timezone — часовой пояс (город / время / IANA-имя)\n"
     "/id — узнать свой Telegram ID\n\n"
     "Администратору: /adduser <id>, /removeuser <id>, /users — управление доступом, "
     "/log — логи бота"
@@ -62,6 +71,40 @@ def fmt_local(dt_utc: datetime, tz: ZoneInfo) -> str:
     local = dt_utc.astimezone(tz)
     dow = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"][local.weekday()]
     return f"{dow}, {local.strftime('%d.%m.%Y %H:%M')}"
+
+
+# Человекочитаемые названия ключей контекста для /context
+CONTEXT_LABELS = {
+    "work_start": "Начало работы",
+    "work_end": "Конец работы",
+    "sleep_start": "Отбой (сон)",
+    "sleep_end": "Подъём",
+    "wake_time": "Подъём",
+    "lunch_start": "Начало обеда",
+    "lunch_end": "Конец обеда",
+    "lunch_time": "Обед",
+    "work_days_of_week": "Рабочие дни",
+    "gym_time": "Спортзал",
+    "breakfast_time": "Завтрак",
+    "dinner_time": "Ужин",
+}
+
+
+def context_label(key: str) -> str:
+    return CONTEXT_LABELS.get(key, key.replace("_", " ").capitalize())
+
+
+def fmt_context_value(value) -> str:
+    """Значение контекста человеческим языком: время, дни недели, условные варианты."""
+    if isinstance(value, list):
+        if value and all(isinstance(x, int) and 0 <= x <= 6 for x in value):
+            return ", ".join(DOW_SHORT[d] for d in value)
+        parts = []
+        for entry in value:
+            if isinstance(entry, dict):
+                parts.append(f"{entry.get('value', '?')} ({describe_when(entry.get('when') or {})})")
+        return "; ".join(parts) if parts else str(value)
+    return str(value)
 
 
 class StatusMessage:
@@ -257,31 +300,53 @@ async def cmd_context(message: Message, db: Database, cfg: Config) -> None:
             "«Я работаю с 9 до 18, сплю с 23 до 7»" + clock
         )
         return
-    lines = [f"• {k}: {v}" for k, v in sorted(ctx.items())]
+    lines = [f"• {context_label(k)}: {fmt_context_value(v)}" for k, v in sorted(ctx.items())]
     await message.answer("📋 Твой распорядок:\n" + "\n".join(lines) + clock)
 
 
 @router.message(Command("timezone"))
 async def cmd_timezone(message: Message, db: Database, cfg: Config) -> None:
+    """Гибкая настройка пояса: IANA-имя, UTC±HH:MM, город или текущее время."""
     user = await db.get_or_create_user(message.from_user.id, message.chat.id, cfg.default_tz)
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
+        now_local = datetime.now(get_tz(user["timezone"]))
         await message.answer(
-            f"Текущий часовой пояс: {user['timezone']}\n"
-            "Сменить: /timezone Europe/Minsk (имя из базы IANA)"
+            f"Текущий часовой пояс: {user['timezone']} "
+            f"(у тебя сейчас {now_local.strftime('%H:%M')}).\n\n"
+            "Сменить можно любым способом:\n"
+            "• /timezone Europe/Minsk — имя из базы IANA\n"
+            "• /timezone Минск — по городу\n"
+            "• /timezone 16:45 — по твоему текущему времени\n"
+            "• /timezone UTC+03:00 — смещение\n"
+            "Или просто напиши в чат «Я из Минска» / «У меня сейчас 16:45»."
         )
         return
-    tz_name = parts[1].strip()
+    arg = parts[1].strip()
+
+    resolved = None
     try:
-        get_tz(tz_name)
+        get_tz(arg)
+        resolved = arg
     except (ZoneInfoNotFoundError, ValueError, KeyError):
+        resolved = city_to_tz(arg)
+        if resolved is None:
+            t = parse_hhmm(arg)
+            if t is not None:
+                offset = offset_from_current_time(t.hour, t.minute, datetime.now(timezone.utc))
+                resolved = offset_tz_name(offset)
+    if resolved is None:
         await message.answer(
-            f"Не знаю пояс «{tz_name}». Пример: Europe/Minsk, Europe/Moscow или UTC+03:00.\n"
-            "Можно проще: напиши «Я из <город>» или «У меня сейчас 16:45» — настрою сам."
+            f"Не понял «{arg}». Примеры: /timezone Europe/Minsk, /timezone Минск, "
+            "/timezone 16:45, /timezone UTC+03:00."
         )
         return
-    await db.set_timezone(message.from_user.id, tz_name)
-    await message.answer(f"✅ Часовой пояс: {tz_name}")
+    await db.set_timezone(message.from_user.id, resolved)
+    now_local = datetime.now(get_tz(resolved))
+    await message.answer(
+        f"✅ Часовой пояс: {resolved}. У тебя сейчас {now_local.strftime('%H:%M')}, верно? "
+        "Если нет — напиши, сколько у тебя времени."
+    )
 
 
 def render_list(
