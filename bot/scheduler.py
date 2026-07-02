@@ -19,6 +19,8 @@ import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from .tzutil import get_tz
+
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -72,7 +74,7 @@ class ReminderScheduler:
         for r in await self.db.due_reminders(now):
             fire_at = datetime.fromisoformat(r["fire_at"])
             tz_name, _ = await self.db.get_user_tz_and_context(r["user_id"])
-            tz = ZoneInfo(tz_name)
+            tz = get_tz(tz_name)
             late = (now - fire_at).total_seconds()
             if late > self.cfg.overdue_threshold:
                 text = (
@@ -96,7 +98,7 @@ class ReminderScheduler:
             try:
                 fire_at = datetime.fromisoformat(c["fire_at"])
                 tz_name, _ = await self.db.get_user_tz_and_context(c["user_id"])
-                tz = ZoneInfo(tz_name)
+                tz = get_tz(tz_name)
                 if fire_at <= now:
                     # бот проспал всё окно условия — вопрос задавать поздно
                     await self.db.set_conditional_status(c["id"], "expired")
@@ -145,7 +147,7 @@ class ReminderScheduler:
 
     async def _process_one_series(self, s: dict, now: datetime) -> None:
         tz_name, ctx = await self.db.get_user_tz_and_context(s["user_id"])
-        tz = ZoneInfo(tz_name)
+        tz = get_tz(tz_name)
         cursor = datetime.fromisoformat(s["last_fired_at"] or s["created_at"])
 
         missed = 0

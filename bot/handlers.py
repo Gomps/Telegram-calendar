@@ -22,8 +22,9 @@ from .db import Database
 from .llm import LLMBadResponse, LLMUnavailable, OllamaClient
 from .logbuffer import MemoryLogHandler, build_pages
 from .prompts import build_system_prompt
-from .rules import describe_rule, missing_context_keys, next_occurrence
+from .rules import describe_rule, missing_context_keys, next_occurrence, parse_hhmm
 from .timeparse import parse_time_expression
+from .tzutil import city_to_tz, get_tz, offset_from_current_time, offset_tz_name
 from .transcribe import Transcriber, TranscriptionError
 
 log = logging.getLogger(__name__)
@@ -31,10 +32,21 @@ router = Router()
 
 HELP_TEXT = (
     "Я — бот умных напоминаний. Пиши (или наговаривай голосом) обычным языком:\n\n"
-    "• «Я работаю с 9 до 18, сплю с 23 до 7» — запомню твой распорядок\n"
+    "📋 Распорядок:\n"
+    "• «Я работаю с 9 до 18, сплю с 23 до 7» — запомню и буду использовать\n"
+    "• «Я из Минска» или «У меня сейчас 16:45» — сам настрою часовой пояс\n\n"
+    "🔔 Разовые напоминания:\n"
+    "• «Напомни через 5 минут выпить чай», «Сделать зарядку напомни через час»\n"
     "• «Когда приду на работу завтра — напомни позвонить клиенту»\n"
+    "• «Сегодня в 19:30 — выключить духовку», «15 августа в 12:00 — поздравить маму»\n"
+    "• «В следующую субботу в 12 — помыть машину»\n\n"
+    "🔁 Периодические:\n"
     "• «Напоминай после работы каждый час пить воду, и так до двух часов до сна»\n"
-    "• «Каждый понедельник в 10:00 — планёрка», «15 августа в 12:00 — поздравить маму»\n\n"
+    "• «Каждый понедельник в 10:00 — планёрка»\n"
+    "• «Напомни через час полить цветы, а потом каждый день» — разовое + серия\n\n"
+    "❓ Условные:\n"
+    "• «Если в 11:30 завтра не буду спать — напомни после обеда выпить таблетку» — "
+    "в 11:30 задам вопрос; подтвердишь — напомню\n\n"
     "Команды:\n"
     "/list — активные напоминания и серии\n"
     "/delete — удалить напоминание или серию\n"
@@ -73,11 +85,11 @@ class StatusMessage:
         except Exception:
             log.debug("Не удалось обновить статусное сообщение", exc_info=True)
 
-    async def finish(self, text: str) -> None:
+    async def finish(self, text: str, reply_markup=None) -> None:
         """Заменяет статусное сообщение результирующим ответом."""
         if self._msg is not None:
             try:
-                await self._msg.edit_text(text)
+                await self._msg.edit_text(text, reply_markup=reply_markup)
                 return
             except Exception:
                 try:
@@ -85,7 +97,7 @@ class StatusMessage:
                 except Exception:
                     log.debug("Не удалось удалить статусное сообщение", exc_info=True)
                 self._msg = None
-        await self._origin.answer(text)
+        await self._origin.answer(text, reply_markup=reply_markup)
 
 
 # --- администрирование: белый список по ID -----------------------------------
@@ -256,9 +268,12 @@ async def cmd_timezone(message: Message, db: Database, cfg: Config) -> None:
         return
     tz_name = parts[1].strip()
     try:
-        ZoneInfo(tz_name)
-    except (ZoneInfoNotFoundError, ValueError):
-        await message.answer(f"Не знаю пояс «{tz_name}». Пример: Europe/Minsk, Europe/Moscow, Asia/Almaty.")
+        get_tz(tz_name)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        await message.answer(
+            f"Не знаю пояс «{tz_name}». Пример: Europe/Minsk, Europe/Moscow или UTC+03:00.\n"
+            "Можно проще: напиши «Я из <город>» или «У меня сейчас 16:45» — настрою сам."
+        )
         return
     await db.set_timezone(message.from_user.id, tz_name)
     await message.answer(f"✅ Часовой пояс: {tz_name}")
@@ -305,7 +320,7 @@ def render_list(
 @router.message(Command("list"))
 async def cmd_list(message: Message, db: Database, cfg: Config) -> None:
     user = await db.get_or_create_user(message.from_user.id, message.chat.id, cfg.default_tz)
-    tz = ZoneInfo(user["timezone"])
+    tz = get_tz(user["timezone"])
     reminders = await db.list_pending_reminders(message.from_user.id)
     series = await db.list_user_series(message.from_user.id)
     conditionals = await db.list_user_conditionals(message.from_user.id)
@@ -319,7 +334,7 @@ async def cmd_list(message: Message, db: Database, cfg: Config) -> None:
 @router.message(Command("delete"))
 async def cmd_delete(message: Message, db: Database, cfg: Config) -> None:
     user = await db.get_or_create_user(message.from_user.id, message.chat.id, cfg.default_tz)
-    tz = ZoneInfo(user["timezone"])
+    tz = get_tz(user["timezone"])
     reminders = await db.list_pending_reminders(message.from_user.id)
     series = await db.list_user_series(message.from_user.id)
     conditionals = await db.list_user_conditionals(message.from_user.id)
@@ -347,7 +362,7 @@ async def cb_delete(callback: CallbackQuery, db: Database) -> None:
     item_id = int(raw_id)
     user_id = callback.from_user.id
     tz_name, ctx = await db.get_user_tz_and_context(user_id)
-    tz = ZoneInfo(tz_name)
+    tz = get_tz(tz_name)
 
     # читаем запись до удаления, чтобы показать, ЧТО именно удалено
     if kind == "r":
@@ -465,6 +480,70 @@ async def _corrective_retry(
         return None
 
 
+# Служебные слова, не влияющие на смысл напоминания
+_FILLER_WORDS = {
+    "напомни", "напоминай", "напомнить", "напоминание", "напоминания",
+    "пожалуйста", "поставь", "создай", "сделай", "чтобы", "нужно", "надо",
+    "мне", "меня", "потом", "если", "когда", "завтра", "сегодня", "через",
+    "каждый", "каждую", "каждое", "каждые", "минут", "минуты", "часов", "часа",
+}
+
+
+def _stems(text: str) -> set[str]:
+    words = re.findall(r"[а-яa-z0-9]+", str(text).lower().replace("ё", "е"))
+    return {w[:4] for w in words if len(w) >= 4 and w not in _FILLER_WORDS}
+
+
+def text_matches_source(reminder_text: str, source: str) -> bool:
+    """Проверка, что LLM не подменила слова напоминания.
+
+    Сравниваются 4-буквенные основы значимых слов (морфологию русского
+    «полей/полить» это переживает). Если меньше половины основ текста
+    напоминания встречается в исходном сообщении — модель что-то придумала,
+    и надо переспросить пользователя.
+    """
+    r, s = _stems(reminder_text), _stems(source)
+    if not r:
+        return True
+    return len(r & s) / len(r) >= 0.5
+
+
+async def _do_set_timezone(action: dict, user_id: int, db: Database) -> str:
+    """Настройка пояса по городу/IANA-имени от LLM или по текущему времени."""
+    tz_name = str(action.get("timezone") or "").strip()
+    city = str(action.get("city") or "").strip()
+    current = str(action.get("current_time") or "").strip()
+
+    resolved = None
+    if tz_name:
+        try:
+            get_tz(tz_name)
+            resolved = tz_name
+        except Exception:
+            resolved = None
+    if resolved is None and city:
+        resolved = city_to_tz(city)
+    if resolved is None and current:
+        t = parse_hhmm(current)
+        if t is not None:
+            offset = offset_from_current_time(t.hour, t.minute, datetime.now(timezone.utc))
+            resolved = offset_tz_name(offset)
+    if resolved is None:
+        return (
+            "Не смог определить часовой пояс 🤔 Напиши, сколько у тебя сейчас "
+            "времени (например «у меня сейчас 16:45») — вычислю пояс по нему."
+        )
+
+    await db.set_timezone(user_id, resolved)
+    now_local = datetime.now(get_tz(resolved))
+    log.info("Пользователь %d: часовой пояс установлен %s", user_id, resolved)
+    return (
+        f"🌍 Часовой пояс: {resolved}.\n"
+        f"У тебя сейчас {now_local.strftime('%H:%M')}, верно? Если нет — напиши, "
+        "сколько у тебя времени, и я пересчитаю."
+    )
+
+
 async def process_text(
     message: Message,
     text: str,
@@ -500,7 +579,7 @@ async def _process_text(
 ) -> None:
     user = await db.get_or_create_user(message.from_user.id, message.chat.id, cfg.default_tz)
     user_id = user["user_id"]
-    tz = ZoneInfo(user["timezone"])
+    tz = get_tz(user["timezone"])
     now_local = datetime.now(timezone.utc).astimezone(tz)
     pending = await db.get_pending_clarification(user_id)
 
@@ -596,6 +675,32 @@ async def _process_text(
         lines = [f"• {k}: {v}" for k, v in updates.items()]
         await status.finish(prefix + "✅ Запомнил:\n" + "\n".join(lines))
         return
+
+    if kind == "set_timezone":
+        msg = await _do_set_timezone(action, user_id, db)
+        await status.finish(prefix + msg)
+        return
+
+    # Модель заменила слова напоминания (не просто опечатки) — переспрашиваем
+    if kind in ("create_reminder", "create_recurring", "create_conditional"):
+        reminder_text = str(action.get("reminder_text") or "").strip()
+        if reminder_text and not text_matches_source(reminder_text, text):
+            await db.set_pending_action(user_id, json.dumps(action, ensure_ascii=False), text)
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Да, верно", callback_data="confirm:yes"),
+                InlineKeyboardButton(text="✏️ Нет, не то", callback_data="confirm:no"),
+            ]])
+            log.info(
+                "Пользователь %d: текст напоминания «%s» не совпадает с сообщением — прошу подтвердить",
+                user_id, reminder_text,
+            )
+            await status.finish(
+                prefix + "🤔 Хочу убедиться, что понял правильно.\n"
+                f"Ты написал: «{text}»\n"
+                f"Я понял напоминание как: «{reminder_text}»\n\nВсё верно?",
+                reply_markup=kb,
+            )
+            return
 
     if kind == "create_reminder":
         msg, _stop, _fire = await _do_create_reminder(action, user, ctx, tz, db, text)
@@ -790,6 +895,51 @@ async def _do_create_conditional(
     )
 
 
+@router.callback_query(F.data.startswith("confirm:"))
+async def cb_confirm(callback: CallbackQuery, db: Database, cfg: Config) -> None:
+    """Подтверждение действия, в котором LLM могла исказить текст напоминания."""
+    user_id = callback.from_user.id
+    pa = await db.get_pending_action(user_id)
+    if pa is None:
+        await callback.answer("Уже неактуально")
+        return
+    await db.clear_pending_action(user_id)
+
+    if callback.data.split(":")[1] == "no":
+        await callback.answer("Ок")
+        if callback.message:
+            try:
+                await callback.message.edit_text(
+                    "Ок, отменил. Сформулируй, пожалуйста, ещё раз — что и когда напомнить?"
+                )
+            except Exception:
+                log.debug("Не удалось отредактировать подтверждение", exc_info=True)
+        return
+
+    action = json.loads(pa["action_json"])
+    raw_text = pa["original_text"]
+    chat_id = callback.message.chat.id if callback.message else user_id
+    user = await db.get_or_create_user(user_id, chat_id, cfg.default_tz)
+    tz = get_tz(user["timezone"])
+    ctx = user["context"]
+
+    kind = action.get("action")
+    if kind == "create_reminder":
+        result, _stop, _fire = await _do_create_reminder(action, user, ctx, tz, db, raw_text)
+    elif kind == "create_recurring":
+        result, _stop = await _do_create_recurring(action, user, ctx, tz, db, raw_text)
+    elif kind == "create_conditional":
+        result, _stop = await _do_create_conditional(action, user, ctx, tz, db, raw_text)
+    else:
+        result = "Не смог выполнить подтверждённое действие — попробуй сформулировать заново."
+    await callback.answer("Подтверждено ✅")
+    if callback.message:
+        try:
+            await callback.message.edit_text(result)
+        except Exception:
+            log.debug("Не удалось отредактировать подтверждение", exc_info=True)
+
+
 @router.callback_query(F.data.startswith("cond:"))
 async def cb_conditional(callback: CallbackQuery, db: Database) -> None:
     _, answer, raw_id = callback.data.split(":")
@@ -800,7 +950,7 @@ async def cb_conditional(callback: CallbackQuery, db: Database) -> None:
         return
 
     tz_name, _ = await db.get_user_tz_and_context(user_id)
-    tz = ZoneInfo(tz_name)
+    tz = get_tz(tz_name)
     fire_at = datetime.fromisoformat(cond["fire_at"])
     now = datetime.now(timezone.utc)
 

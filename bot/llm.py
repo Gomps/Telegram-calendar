@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 
 ACTIONS = {
     "save_context", "create_reminder", "create_recurring", "create_conditional",
-    "ask_clarification", "not_a_reminder",
+    "set_timezone", "ask_clarification", "not_a_reminder",
 }
 
 
@@ -86,6 +86,12 @@ def normalize_action(data: dict) -> dict:
                 norm = normalize_hhmm(anchor["time"])
                 if norm is not None:
                     anchor["time"] = norm
+
+    current = data.get("current_time")
+    if current is not None:
+        norm = normalize_hhmm(current)
+        if norm is not None:
+            data["current_time"] = norm
 
     for field in ("fire_at", "check_at"):
         value = data.get(field)
@@ -178,6 +184,12 @@ def validate_action(data: dict, allow_multi: bool = True) -> list[str]:
                     errors.append(f"{iso_field} «{iso_value}» не разбирается как YYYY-MM-DDTHH:MM")
             elif not str(data.get(expr_field) or "").strip():
                 errors.append(f"для create_conditional нужен {iso_field} или {expr_field}")
+
+    if action == "set_timezone":
+        if not any(
+            str(data.get(k) or "").strip() for k in ("timezone", "city", "current_time")
+        ):
+            errors.append("для set_timezone нужен timezone, city или current_time")
 
     if action == "ask_clarification":
         if not str(data.get("clarification_question", "")).strip():

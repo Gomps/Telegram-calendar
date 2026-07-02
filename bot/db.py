@@ -64,6 +64,13 @@ CREATE TABLE IF NOT EXISTS allowed_users (
     created_at TEXT    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS pending_actions (
+    user_id       INTEGER PRIMARY KEY,
+    action_json   TEXT NOT NULL,   -- действие LLM, ожидающее подтверждения пользователя
+    original_text TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS pending_clarifications (
     user_id          INTEGER PRIMARY KEY,
     original_request TEXT NOT NULL,
@@ -343,6 +350,29 @@ class Database:
             "SELECT * FROM allowed_users ORDER BY created_at"
         )
         return [dict(r) for r in await cur.fetchall()]
+
+    # --- действия, ожидающие подтверждения ----------------------------------------
+
+    async def set_pending_action(self, user_id: int, action_json: str, original_text: str) -> None:
+        await self.db.execute(
+            "INSERT INTO pending_actions (user_id, action_json, original_text, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET action_json = excluded.action_json, "
+            "original_text = excluded.original_text, created_at = excluded.created_at",
+            (user_id, action_json, original_text, utcnow_iso()),
+        )
+        await self.db.commit()
+
+    async def get_pending_action(self, user_id: int) -> Optional[dict]:
+        cur = await self.db.execute(
+            "SELECT * FROM pending_actions WHERE user_id = ?", (user_id,)
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def clear_pending_action(self, user_id: int) -> None:
+        await self.db.execute("DELETE FROM pending_actions WHERE user_id = ?", (user_id,))
+        await self.db.commit()
 
     # --- незавершённые уточнения -------------------------------------------------
 

@@ -107,7 +107,11 @@ def _parse_day(s: str, now: datetime) -> tuple[Optional[date], bool]:
 
     for name, idx in WEEKDAYS.items():
         if re.search(r"\b" + name + r"\b", s):
-            days_ahead = (idx - now.weekday()) % 7
+            if re.search(r"следующ", s):
+                # «в следующий вторник» = вторник на следующей календарной неделе
+                days_ahead = (7 - now.weekday()) + idx
+            else:
+                days_ahead = (idx - now.weekday()) % 7
             return (now + timedelta(days=days_ahead)).date(), True
 
     return None, False
