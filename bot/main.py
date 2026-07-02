@@ -30,14 +30,20 @@ async def main() -> None:
     log.info("БД подключена: %s", cfg.db_path)
 
     llm = OllamaClient(cfg.ollama_url, cfg.ollama_model, retries=cfg.llm_retries)
-    if await llm.healthcheck():
-        log.info("Ollama доступна: %s (модель %s)", cfg.ollama_url, cfg.ollama_model)
-    else:
+    server_ok, model_ok = await llm.healthcheck()
+    if not server_ok:
         log.warning(
             "Ollama недоступна на %s — бот запустится, но разбор сообщений не будет "
             "работать, пока Ollama не поднимется.",
             cfg.ollama_url,
         )
+    elif not model_ok:
+        log.warning(
+            "Ollama работает, но модель «%s» не найдена. Выполните: ollama pull %s",
+            cfg.ollama_model, cfg.ollama_model,
+        )
+    else:
+        log.info("Ollama доступна: %s (модель %s)", cfg.ollama_url, cfg.ollama_model)
 
     bot = Bot(token=cfg.bot_token)
     dp = Dispatcher()

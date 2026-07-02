@@ -6,12 +6,13 @@
 
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any, Optional
 
 import httpx
 
-from .rules import parse_hhmm, validate_rule
+from .rules import normalize_hhmm, parse_hhmm, validate_rule
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +52,49 @@ def _extract_json(text: str) -> Optional[dict]:
                         break
         start = text.find("{", start + 1)
     return None
+
+
+def normalize_action(data: dict) -> dict:
+    """Приводит времена в ответе модели к канону до валидации.
+
+    Модель нередко повторяет формат пользователя («16.30», «7» вместо «16:30»,
+    «07:00») — не отбрасываем такой ответ, а чиним детерминированно.
+    """
+    updates = data.get("context_updates")
+    if isinstance(updates, dict):
+        for key, value in list(updates.items()):
+            norm = normalize_hhmm(value)
+            if norm is not None:
+                updates[key] = norm
+
+    rec = data.get("recurring")
+    if isinstance(rec, dict):
+        norm = normalize_hhmm(rec.get("time", ""))
+        if norm is not None:
+            rec["time"] = norm
+        for name in ("start_anchor", "end_anchor"):
+            anchor = rec.get(name)
+            if isinstance(anchor, dict) and "time" in anchor:
+                norm = normalize_hhmm(anchor["time"])
+                if norm is not None:
+                    anchor["time"] = norm
+
+    fire_at = data.get("fire_at")
+    if isinstance(fire_at, str):
+        # «2026-07-03T16.30» / «2026-07-03 16-30» -> «2026-07-03T16:30».
+        # Чинить надо ДО fromisoformat: Python разбирает «T16.30» как
+        # 16:00:00.300000 (доли часа) — напоминание молча встало бы не на то время.
+        fixed = re.sub(
+            r"[T ]\s*(\d{1,2})[.\-](\d{2})\s*$",
+            lambda m: f"T{int(m.group(1)):02d}:{m.group(2)}",
+            fire_at.strip(),
+        )
+        try:
+            datetime.fromisoformat(fixed)
+            data["fire_at"] = fixed
+        except ValueError:
+            pass
+    return data
 
 
 def validate_action(data: dict) -> list[str]:
@@ -115,11 +159,16 @@ class OllamaClient:
             raw = await self._chat(messages)
             log.debug("LLM raw (attempt %d): %s", attempt, raw)
             data = _extract_json(raw)
+            if data is not None:
+                data = normalize_action(data)
             errors = ["ответ не является JSON-объектом"] if data is None else validate_action(data)
             if not errors:
                 return data  # type: ignore[return-value]
             last_errors = errors
-            log.warning("Невалидный ответ LLM (попытка %d/%d): %s", attempt, self.retries, errors)
+            log.warning(
+                "Невалидный ответ LLM (попытка %d/%d): %s; ответ: %.300r",
+                attempt, self.retries, errors, raw,
+            )
             messages.append({"role": "assistant", "content": raw})
             messages.append({
                 "role": "user",
@@ -146,10 +195,13 @@ class OllamaClient:
         except (httpx.HTTPError, json.JSONDecodeError) as e:
             raise LLMUnavailable(str(e)) from e
 
-    async def healthcheck(self) -> bool:
+    async def healthcheck(self) -> tuple[bool, bool]:
+        """(сервер доступен, модель скачана)."""
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(f"{self.base_url}/api/tags")
-                return resp.status_code == 200
-        except httpx.HTTPError:
-            return False
+                resp.raise_for_status()
+                models = {m.get("name", "") for m in resp.json().get("models", [])}
+        except (httpx.HTTPError, json.JSONDecodeError):
+            return False, False
+        return True, self.model in models or f"{self.model}:latest" in models

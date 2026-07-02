@@ -46,6 +46,42 @@ def fmt_local(dt_utc: datetime, tz: ZoneInfo) -> str:
     return f"{dow}, {local.strftime('%d.%m.%Y %H:%M')}"
 
 
+class StatusMessage:
+    """Статусное сообщение о ходе обработки.
+
+    Бот сразу отвечает «⏳ …», по мере прохождения этапов редактирует это
+    сообщение, а в конце заменяет его результирующим ответом (если
+    отредактировать нельзя — удаляет и отправляет новое).
+    """
+
+    def __init__(self, origin: Message):
+        self._origin = origin
+        self._msg: Message | None = None
+
+    async def set(self, text: str) -> None:
+        try:
+            if self._msg is None:
+                self._msg = await self._origin.answer(text)
+            else:
+                await self._msg.edit_text(text)
+        except Exception:
+            log.debug("Не удалось обновить статусное сообщение", exc_info=True)
+
+    async def finish(self, text: str) -> None:
+        """Заменяет статусное сообщение результирующим ответом."""
+        if self._msg is not None:
+            try:
+                await self._msg.edit_text(text)
+                return
+            except Exception:
+                try:
+                    await self._msg.delete()
+                except Exception:
+                    log.debug("Не удалось удалить статусное сообщение", exc_info=True)
+                self._msg = None
+        await self._origin.answer(text)
+
+
 # --- администрирование: белый список по ID -----------------------------------
 
 
@@ -236,7 +272,8 @@ async def on_voice(
     transcriber: Transcriber,
     cfg: Config,
 ) -> None:
-    await bot.send_chat_action(message.chat.id, "typing")
+    status = StatusMessage(message)
+    await status.set("⏳ Этап 1/3: распознаю голосовое сообщение…")
     tmp_path = None
     try:
         file = await bot.get_file(message.voice.file_id)
@@ -246,31 +283,70 @@ async def on_voice(
         text = await transcriber.transcribe(tmp_path)
     except TranscriptionError as e:
         log.warning("Транскрибация не удалась: %s", e)
-        await message.answer("😔 Не удалось распознать голосовое сообщение. Попробуй ещё раз или напиши текстом.")
+        await status.finish(
+            "😔 Не удалось распознать голосовое сообщение. Попробуй ещё раз или напиши текстом."
+        )
         return
     except Exception:
         log.exception("Ошибка обработки голосового сообщения")
-        await message.answer("😔 Не удалось обработать голосовое сообщение.")
+        await status.finish("😔 Не удалось обработать голосовое сообщение.")
         return
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
-    await message.answer(f"🎙 Распознал: «{text}»")
-    await process_text(message, text, db, llm, cfg, bot)
+    await process_text(message, text, db, llm, cfg, bot, status, prefix=f"🎙 «{text}»\n\n")
 
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(
     message: Message, bot: Bot, db: Database, llm: OllamaClient, cfg: Config
 ) -> None:
-    await process_text(message, message.text, db, llm, cfg, bot)
+    status = StatusMessage(message)
+    await process_text(message, message.text, db, llm, cfg, bot, status)
+
+
+@router.message()
+async def on_other(message: Message) -> None:
+    """Фолбэк: бот всегда отвечает, даже на неподдерживаемый тип сообщения."""
+    await message.answer(
+        "Я понимаю текстовые и голосовые сообщения 🙂 Напиши, о чём напомнить, — см. /start"
+    )
 
 
 # --- основной конвейер -------------------------------------------------------
 
 
 async def process_text(
-    message: Message, text: str, db: Database, llm: OllamaClient, cfg: Config, bot: Bot
+    message: Message,
+    text: str,
+    db: Database,
+    llm: OllamaClient,
+    cfg: Config,
+    bot: Bot,
+    status: StatusMessage,
+    prefix: str = "",
+) -> None:
+    """Конвейер обработки. Любой исход завершается заменой статусного
+    сообщения на результирующий ответ — бот никогда не молчит."""
+    try:
+        await _process_text(message, text, db, llm, cfg, bot, status, prefix)
+    except Exception:
+        log.exception("Необработанная ошибка конвейера (пользователь %d)", message.from_user.id)
+        await status.finish(
+            prefix + "⚠️ Внутренняя ошибка при обработке сообщения. "
+            "Попробуй ещё раз; подробности — в логах бота."
+        )
+
+
+async def _process_text(
+    message: Message,
+    text: str,
+    db: Database,
+    llm: OllamaClient,
+    cfg: Config,
+    bot: Bot,
+    status: StatusMessage,
+    prefix: str,
 ) -> None:
     user = await db.get_or_create_user(message.from_user.id, message.chat.id, cfg.default_tz)
     user_id = user["user_id"]
@@ -278,23 +354,27 @@ async def process_text(
     now_local = datetime.now(timezone.utc).astimezone(tz)
     pending = await db.get_pending_clarification(user_id)
 
-    await bot.send_chat_action(message.chat.id, "typing")
+    await status.set(prefix + "⏳ Этап 2/3: разбираю запрос (LLM)…")
     system_prompt = build_system_prompt(now_local, user["timezone"], user["context"], pending)
     try:
         action = await llm.parse_message(system_prompt, text)
     except LLMUnavailable as e:
         log.error("Ollama недоступна: %s", e)
-        await message.answer(
-            "⚠️ Языковая модель сейчас недоступна (Ollama не отвечает). "
-            "Проверь, что Ollama запущена, и повтори сообщение."
+        await status.finish(
+            prefix + "⚠️ Языковая модель сейчас недоступна (Ollama не отвечает). "
+            "Проверь, что Ollama запущена и модель скачана, и повтори сообщение."
         )
         return
     except LLMBadResponse as e:
         log.error("LLM не вернула валидный JSON: %s", e)
-        await message.answer("😕 Не смог разобрать запрос. Попробуй сформулировать иначе.")
+        await status.finish(
+            prefix + "😕 Не смог разобрать запрос. Попробуй сформулировать иначе — "
+            "например, укажи время с двоеточием: «в 16:30»."
+        )
         return
 
     log.info("Пользователь %d: action=%s", user_id, action.get("action"))
+    await status.set(prefix + "⏳ Этап 3/3: сохраняю…")
 
     # Новые факты о распорядке применяем при любом действии
     ctx = user["context"]
@@ -307,15 +387,15 @@ async def process_text(
     if kind == "save_context":
         await db.clear_pending_clarification(user_id)
         lines = [f"• {k}: {v}" for k, v in updates.items()]
-        await message.answer("✅ Запомнил:\n" + "\n".join(lines))
+        await status.finish(prefix + "✅ Запомнил:\n" + "\n".join(lines))
         return
 
     if kind == "create_reminder":
-        await handle_create_reminder(message, action, user, ctx, tz, db)
+        await handle_create_reminder(action, user, ctx, tz, db, status, prefix)
         return
 
     if kind == "create_recurring":
-        await handle_create_recurring(message, action, user, ctx, tz, db, text)
+        await handle_create_recurring(action, user, ctx, tz, db, text, status, prefix)
         return
 
     if kind == "ask_clarification":
@@ -325,29 +405,30 @@ async def process_text(
         if pending and pending["original_request"] != text:
             original = f"{pending['original_request']} (уточнение: {text})"
         await db.set_pending_clarification(user_id, original, question)
-        await message.answer("❓ " + question)
+        await status.finish(prefix + "❓ " + question)
         return
 
     # not_a_reminder
     if pending:
         # пользователь сменил тему — не держим устаревший вопрос
         await db.clear_pending_clarification(user_id)
-    await message.answer(
-        "Это, кажется, не про напоминания 🙂 Я умею запоминать распорядок и ставить "
-        "напоминания — см. /start"
+    await status.finish(
+        prefix + "Это, кажется, не про напоминания 🙂 Я умею запоминать распорядок и "
+        "ставить напоминания — см. /start"
     )
 
 
 async def handle_create_reminder(
-    message: Message, action: dict, user: dict, ctx: dict, tz: ZoneInfo, db: Database
+    action: dict, user: dict, ctx: dict, tz: ZoneInfo, db: Database,
+    status: StatusMessage, prefix: str,
 ) -> None:
     fire_local = datetime.fromisoformat(str(action["fire_at"]))
     if fire_local.tzinfo is None:
         fire_local = fire_local.replace(tzinfo=tz)
     fire_utc = fire_local.astimezone(timezone.utc)
     if fire_utc <= datetime.now(timezone.utc):
-        await message.answer(
-            f"Похоже, это время уже прошло ({fire_local.strftime('%d.%m.%Y %H:%M')}). "
+        await status.finish(
+            prefix + f"Похоже, это время уже прошло ({fire_local.strftime('%d.%m.%Y %H:%M')}). "
             "Уточни, когда напомнить?"
         )
         return
@@ -356,13 +437,14 @@ async def handle_create_reminder(
     )
     await db.clear_pending_clarification(user["user_id"])
     log.info("Создано напоминание #%d на %s", reminder_id, fire_utc)
-    await message.answer(
-        f"✅ Напомню: «{action['reminder_text'].strip()}»\n🕐 {fmt_local(fire_utc, tz)}"
+    await status.finish(
+        prefix + f"✅ Напомню: «{action['reminder_text'].strip()}»\n🕐 {fmt_local(fire_utc, tz)}"
     )
 
 
 async def handle_create_recurring(
-    message: Message, action: dict, user: dict, ctx: dict, tz: ZoneInfo, db: Database, raw_text: str
+    action: dict, user: dict, ctx: dict, tz: ZoneInfo, db: Database, raw_text: str,
+    status: StatusMessage, prefix: str,
 ) -> None:
     rule = action["recurring"]
     # Правило ссылается на распорядок, которого нет, — доспрашиваем, а не создаём пустышку
@@ -376,7 +458,7 @@ async def handle_create_recurring(
         }
         question = questions.get(missing[0], f"Уточни время «{missing[0]}» (HH:MM)?")
         await db.set_pending_clarification(user["user_id"], raw_text, question)
-        await message.answer("❓ " + question)
+        await status.finish(prefix + "❓ " + question)
         return
 
     series_id = await db.add_series(
@@ -387,8 +469,8 @@ async def handle_create_recurring(
 
     nxt = next_occurrence(rule, ctx, datetime.now(timezone.utc), tz)
     nxt_s = f"\n🕐 Ближайшее: {fmt_local(nxt.astimezone(timezone.utc), tz)}" if nxt else ""
-    await message.answer(
-        f"✅ Серия создана: «{action['reminder_text'].strip()}»\n"
+    await status.finish(
+        prefix + f"✅ Серия создана: «{action['reminder_text'].strip()}»\n"
         f"📅 {describe_rule(rule, ctx)}{nxt_s}\n"
         "При изменении распорядка расписание пересчитается автоматически."
     )

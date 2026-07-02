@@ -23,17 +23,33 @@ from datetime import date, datetime, time, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+# Люди (и LLM вслед за ними) пишут время как «16.30», «16-30», «7», «22» —
+# принимаем всё это и приводим к каноническому «HH:MM».
+HOUR_ONLY_RE = re.compile(r"^([01]?\d|2[0-3])$")
+TIME_LENIENT_RE = re.compile(r"^([01]?\d|2[0-3])(?:\s*[:.\-чh]\s*|\s+)?([0-5]\d)$")
 
 # Ключи контекста, которые считаем «временем» и подставляем в якоря
 CONTEXT_TIME_HINT = ("work_start", "work_end", "sleep_start", "sleep_end")
 
 
-def parse_hhmm(value: str) -> Optional[time]:
-    m = TIME_RE.match(str(value).strip())
-    if not m:
+def normalize_hhmm(value) -> Optional[str]:
+    """«16.30» / «16-30» / «7» / «16:30» -> «16:30» / «07:00». None — не время."""
+    s = str(value).strip().lower().rstrip(".")
+    m = HOUR_ONLY_RE.match(s)
+    if m:
+        return f"{int(m.group(1)):02d}:00"
+    m = TIME_LENIENT_RE.match(s)
+    if m:
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+    return None
+
+
+def parse_hhmm(value) -> Optional[time]:
+    s = normalize_hhmm(value)
+    if s is None:
         return None
-    return time(int(m.group(1)), int(m.group(2)))
+    hh, mm = s.split(":")
+    return time(int(hh), int(mm))
 
 
 def resolve_anchor(anchor: dict, ctx: dict, day: date, tz: ZoneInfo) -> Optional[datetime]:

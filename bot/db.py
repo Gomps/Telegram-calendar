@@ -114,7 +114,11 @@ class Database:
             "SELECT context_json FROM users WHERE user_id = ?", (user_id,)
         )
         row = await cur.fetchone()
-        ctx = json.loads(row["context_json"]) if row else {}
+        if row is None:
+            # get_or_create_user всегда должен вызываться раньше; молчаливый
+            # no-op здесь означал бы «✅ Запомнил» без реального сохранения
+            raise RuntimeError(f"update_context: пользователь {user_id} не зарегистрирован")
+        ctx = json.loads(row["context_json"])
         ctx.update(updates)
         await self.db.execute(
             "UPDATE users SET context_json = ? WHERE user_id = ?",
