@@ -71,7 +71,25 @@ LLM возвращает строго один JSON-объект (действи
   вычисляются на каждом тике из актуального контекста, поэтому смена
   распорядка мгновенно пересчитывает серию.
 
-## Установка
+## Что нужно установить
+
+Полный список зависимостей для работы бота:
+
+| Компонент | Зачем | Как установить |
+|---|---|---|
+| **Python 3.11+** | язык, на котором написан бот | `sudo apt install python3.11` / [python.org](https://www.python.org/downloads/) |
+| **ffmpeg** | Whisper читает через него голосовые (.ogg) | `sudo apt install ffmpeg` (macOS: `brew install ffmpeg`) |
+| **Ollama** | локальный сервер LLM | `curl -fsSL https://ollama.com/install.sh \| sh` |
+| **Модель qwen3.5:4b** | разбор естественного языка | `ollama pull qwen3.5:4b` (~2.5 ГБ) |
+| **Python-пакеты** | aiogram, aiosqlite, httpx, python-dotenv, openai-whisper (+PyTorch) | `pip install -r requirements.txt` |
+| **Модель Whisper medium** | распознавание речи | скачается автоматически при первом голосовом (~1.5 ГБ) |
+| **Токен Telegram-бота** | доступ к Telegram Bot API | получить у [@BotFather](https://t.me/BotFather), вписать в `.env` |
+
+Ориентировочные требования: ~5 ГБ диска под модели и от 8 ГБ ОЗУ
+(qwen3.5:4b и whisper-medium на CPU; с GPU всё заметно быстрее).
+На слабой машине поставьте в `.env` `WHISPER_MODEL=small` или `base`.
+
+## Установка по шагам
 
 ### 1. Системные зависимости
 
@@ -88,6 +106,9 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama pull qwen3.5:4b
 ollama serve   # если не запущена как сервис
 ```
+
+Проверка: `curl http://localhost:11434/api/tags` должен вернуть JSON со
+списком моделей, в котором есть `qwen3.5:4b`.
 
 ### 3. Python-окружение
 
