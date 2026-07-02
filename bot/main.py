@@ -4,6 +4,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import Bot, Dispatcher
 
@@ -41,6 +42,16 @@ async def main() -> None:
         log.info("Логи пишутся в %s (загружено %d строк истории)", cfg.log_file, seeded)
 
     logging.getLogger().addHandler(logbuffer)
+
+    # Fail-fast: без базы часовых поясов бот бесполезен (на Windows её нет
+    # в системе — нужна pip-зависимость tzdata)
+    try:
+        ZoneInfo(cfg.default_tz)
+    except ZoneInfoNotFoundError:
+        raise RuntimeError(
+            f"Часовой пояс «{cfg.default_tz}» не найден. База поясов IANA "
+            "недоступна — установите её: pip install tzdata (входит в requirements.txt)."
+        ) from None
 
     os.makedirs(os.path.dirname(cfg.db_path) or ".", exist_ok=True)
     db = Database(cfg.db_path)

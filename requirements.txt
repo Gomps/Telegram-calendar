@@ -3,3 +3,6 @@ aiosqlite>=0.20
 httpx>=0.27
 python-dotenv>=1.0
 openai-whisper>=20240930
+# База часовых поясов IANA: обязательна на Windows (у системы её нет),
+# на Linux/macOS безвредна
+tzdata>=2024.1

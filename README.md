@@ -83,7 +83,7 @@ LLM возвращает строго один JSON-объект (действи
 | **ffmpeg** | Whisper читает через него голосовые (.ogg) | `sudo apt install ffmpeg` (macOS: `brew install ffmpeg`) |
 | **Ollama** | локальный сервер LLM | `curl -fsSL https://ollama.com/install.sh \| sh` |
 | **Модель qwen3.5:4b** | разбор естественного языка | `ollama pull qwen3.5:4b` (~2.5 ГБ) |
-| **Python-пакеты** | aiogram, aiosqlite, httpx, python-dotenv, openai-whisper (+PyTorch) | `pip install -r requirements.txt` |
+| **Python-пакеты** | aiogram, aiosqlite, httpx, python-dotenv, openai-whisper (+PyTorch), tzdata | `pip install -r requirements.txt` |
 | **Модель Whisper medium** | распознавание речи | скачается автоматически при первом голосовом (~1.5 ГБ) |
 | **Токен Telegram-бота** | доступ к Telegram Bot API | получить у [@BotFather](https://t.me/BotFather), вписать в `.env` |
 
@@ -190,6 +190,11 @@ python -m bot.main
 заменяется результирующим ответом (если Telegram не даёт отредактировать —
 удаляется и отправляется новое). Бот никогда не оставляет сообщение без
 ответа: любая внутренняя ошибка тоже показывается пользователю.
+
+> **Windows:** пакет `tzdata` обязателен — в Windows нет системной базы
+> часовых поясов IANA, без него любое сообщение падает с
+> `ZoneInfoNotFoundError: No time zone found with key Europe/Minsk`.
+> Он входит в `requirements.txt`; отдельно: `pip install tzdata`.
 
 ## Диагностика («бот молчит / ничего не сохранилось»)
 
