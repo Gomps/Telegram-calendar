@@ -23,6 +23,12 @@ from .config import Config
 from .db import Database
 from .llm import LLMBadResponse, LLMUnavailable, OllamaClient
 from .logbuffer import MemoryLogHandler, build_pages
+from .postprocess import (
+    enforce_weekday,
+    is_periodic_text,
+    sanitize_action,
+    text_matches_source,
+)
 from .prompts import build_system_prompt
 from .rules import (
     DOW_SHORT,
@@ -577,13 +583,6 @@ async def on_other(message: Message) -> None:
 
 # --- основной конвейер -------------------------------------------------------
 
-# Явные признаки периодичности в тексте — для сверки классификации LLM
-PERIODIC_RE = re.compile(
-    r"\b(кажд\w+|ежедневн\w*|еженедельн\w*|ежемесячн\w*|ежечасн\w*|раз\s+в\b|"
-    r"по\s+будням|по\s+выходным|"
-    r"по\s+(понедельник|вторник|сред|четверг|пятниц|суббот|воскресень)\w*)"
-)
-
 
 async def _corrective_retry(
     llm: OllamaClient, system_prompt: str, hint: str, text: str
@@ -593,34 +592,6 @@ async def _corrective_retry(
         return await llm.parse_message(system_prompt + hint, text)
     except (LLMUnavailable, LLMBadResponse):
         return None
-
-
-# Служебные слова, не влияющие на смысл напоминания
-_FILLER_WORDS = {
-    "напомни", "напоминай", "напомнить", "напоминание", "напоминания",
-    "пожалуйста", "поставь", "создай", "сделай", "чтобы", "нужно", "надо",
-    "мне", "меня", "потом", "если", "когда", "завтра", "сегодня", "через",
-    "каждый", "каждую", "каждое", "каждые", "минут", "минуты", "часов", "часа",
-}
-
-
-def _stems(text: str) -> set[str]:
-    words = re.findall(r"[а-яa-z0-9]+", str(text).lower().replace("ё", "е"))
-    return {w[:4] for w in words if len(w) >= 4 and w not in _FILLER_WORDS}
-
-
-def text_matches_source(reminder_text: str, source: str) -> bool:
-    """Проверка, что LLM не подменила слова напоминания.
-
-    Сравниваются 4-буквенные основы значимых слов (морфологию русского
-    «полей/полить» это переживает). Если меньше половины основ текста
-    напоминания встречается в исходном сообщении — модель что-то придумала,
-    и надо переспросить пользователя.
-    """
-    r, s = _stems(reminder_text), _stems(source)
-    if not r:
-        return True
-    return len(r & s) / len(r) >= 0.5
 
 
 async def _do_set_timezone(action: dict, user_id: int, db: Database) -> str:
@@ -725,30 +696,27 @@ async def _process_text(
         return
 
     log.info("Пользователь %d: action=%s", user_id, action.get("action"))
+    # Жёсткая детерминированная правка черновика LLM по исходному тексту:
+    # классификация, дни недели, чётность, шаг, осмысленность вопросов
+    action = sanitize_action(action, text, now_local)
     kind = action["action"]
 
-    # Сверка классификации: признаки периодичности в тексте против типа
-    # действия — модель путает «через 5 минут» с серией и наоборот
-    if depth == 0 and kind in ("create_reminder", "create_recurring"):
-        periodic = PERIODIC_RE.search(text.lower().replace("ё", "е")) is not None
-        hint = None
-        if kind == "create_recurring" and not periodic:
-            hint = (
-                "\n\nВАЖНО: в сообщении НЕТ признаков периодичности («каждый», «ежедневно», "
-                "«по понедельникам», «раз в…»). Это РАЗОВОЕ напоминание — верни create_reminder."
-            )
-        elif kind == "create_reminder" and periodic:
-            hint = (
-                "\n\nВАЖНО: в сообщении ЕСТЬ признак периодичности. Вероятно, нужен "
-                "create_recurring или multi (разовое + серия), см. правило 12."
-            )
-        if hint:
-            log.info("Классификация «%s» не согласуется с текстом — корректирующий повтор", kind)
-            await status.set(prefix + "⏳ Этап 2/3: перепроверяю разбор…")
-            corrected = await _corrective_retry(llm, system_prompt, hint, text)
-            if corrected is not None:
-                action, kind = corrected, corrected["action"]
-                log.info("Пользователь %d: action после сверки=%s", user_id, kind)
+    # Фолбэк: в тексте есть периодичность, но правило детерминированно не
+    # достроилось (интервальная серия без границ) — один повтор через LLM
+    if depth == 0 and kind == "create_reminder" and is_periodic_text(text):
+        log.info("Периодичность в тексте, но разовое — корректирующий повтор LLM")
+        await status.set(prefix + "⏳ Этап 2/3: перепроверяю разбор…")
+        corrected = await _corrective_retry(
+            llm,
+            system_prompt,
+            "\n\nВАЖНО: в сообщении ЕСТЬ признак периодичности. Вероятно, нужен "
+            "create_recurring (с якорями start/end для интервала) или multi, см. правило 12.",
+            text,
+        )
+        if corrected is not None:
+            action = sanitize_action(corrected, text, now_local)
+            kind = action["action"]
+            log.info("Пользователь %d: action после сверки=%s", user_id, kind)
 
     await status.set(prefix + "⏳ Этап 3/3: сохраняю…")
 
@@ -773,7 +741,8 @@ async def _process_text(
             )
             corrected = await _corrective_retry(llm, system_prompt, hint, text)
             if corrected is not None:
-                action, kind = corrected, corrected["action"]
+                action = sanitize_action(corrected, text, now_local)
+                kind = action["action"]
                 new_updates = corrected.get("context_updates") or {}
                 if new_updates:
                     ctx = await db.update_context(user_id, new_updates)
@@ -946,6 +915,9 @@ async def _do_create_reminder(
         )
         await db.set_pending_clarification(user["user_id"], raw_text, question)
         return "❓ " + question, True, None, None
+
+    # день результата обязан совпадать с днём недели, названным в сообщении
+    fire_local = enforce_weekday(fire_local, raw_text, now_local)
 
     fire_utc = fire_local.astimezone(timezone.utc)
     if fire_utc <= datetime.now(timezone.utc):

@@ -54,6 +54,59 @@ def parse_time_expression(expr: str, now: datetime) -> Optional[datetime]:
     return result
 
 
+def _norm(text: str) -> str:
+    return " ".join(str(text).lower().replace("ё", "е").split())
+
+
+# Паттерны с падежными/множественными окончаниями («вторникам», «по средам»);
+# «сред» ограничен явными окончаниями, чтобы не ловить «среди», «средство»
+WEEKDAY_PATTERNS = [
+    (re.compile(r"\bпонедельник\w*"), 0),
+    (re.compile(r"\bвторник\w*"), 1),
+    (re.compile(r"\bсред(?:а|у|ы|е|ой|ам|ах)\b"), 2),
+    (re.compile(r"\bчетверг\w*"), 3),
+    (re.compile(r"\bпятниц\w*"), 4),
+    (re.compile(r"\bсуббот\w*"), 5),
+    (re.compile(r"\bвоскресень\w*"), 6),
+]
+
+
+def extract_weekdays(text: str) -> list[int]:
+    """Все дни недели, упомянутые в тексте (0=пн), без дубликатов, по порядку."""
+    s = _norm(text)
+    found: list[int] = []
+    for pattern, idx in WEEKDAY_PATTERNS:
+        if idx not in found and pattern.search(s):
+            found.append(idx)
+    return found
+
+
+def extract_parity(text: str) -> Optional[str]:
+    """«по чётным (дням/числам)» -> "even", «по нечётным» -> "odd"."""
+    s = _norm(text)
+    if re.search(r"\bнечетн", s):
+        return "odd"
+    if re.search(r"\bчетн", s):
+        return "even"
+    return None
+
+
+def extract_interval_minutes(text: str) -> Optional[int]:
+    """Шаг повторения из текста: «раз в час», «каждые 30 минут», «каждые 2 часа»…"""
+    s = _norm(text)
+    m = re.search(r"(?:каждые|каждый|каждую|раз\s+в)\s+(\d+)\s*(час\w*|ч\b|минут\w*|мин\b)", s)
+    if m:
+        n = int(m.group(1))
+        return n * 60 if m.group(2).startswith(("час", "ч")) else n
+    if re.search(r"(?:каждые|раз\s+в)\s+полчаса", s):
+        return 30
+    if re.search(r"(?:каждый|раз\s+в)\s+час\b", s) or re.search(r"\bежечасн", s):
+        return 60
+    if re.search(r"(?:каждую|раз\s+в)\s+минуту\b", s):
+        return 1
+    return None
+
+
 def has_day_marker(expr: str) -> bool:
     """Есть ли в выражении указание дня (дата, день недели, «завтра», «через…»).
 
