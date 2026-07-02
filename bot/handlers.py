@@ -327,13 +327,39 @@ async def cmd_delete(message: Message, db: Database, cfg: Config) -> None:
 async def cb_delete(callback: CallbackQuery, db: Database) -> None:
     _, kind, raw_id = callback.data.split(":")
     item_id = int(raw_id)
+    user_id = callback.from_user.id
+    tz_name, ctx = await db.get_user_tz_and_context(user_id)
+    tz = ZoneInfo(tz_name)
+
+    # читаем запись до удаления, чтобы показать, ЧТО именно удалено
     if kind == "r":
-        ok = await db.cancel_reminder(callback.from_user.id, item_id)
+        item = await db.get_reminder(user_id, item_id)
+        ok = await db.cancel_reminder(user_id, item_id)
+        if ok and item:
+            fire_at = datetime.fromisoformat(item["fire_at"])
+            result = f"🗑 Удалено напоминание: «{item['text']}»\n🕐 было на {fmt_local(fire_at, tz)}"
+            log.info("Пользователь %d удалил напоминание #%d («%s»)", user_id, item_id, item["text"])
+        else:
+            result = "Уже неактуально."
     else:
-        ok = await db.deactivate_series(callback.from_user.id, item_id)
+        item = await db.get_series(user_id, item_id)
+        ok = await db.deactivate_series(user_id, item_id)
+        if ok and item:
+            try:
+                desc = describe_rule(item["rule"], ctx)
+            except Exception:
+                desc = "правило не читается"
+            result = f"🗑 Удалена серия: «{item['text']}»\n📅 была: {desc}"
+            log.info("Пользователь %d удалил серию #%d («%s»)", user_id, item_id, item["text"])
+        else:
+            result = "Уже неактуально."
+
     await callback.answer("Удалено ✅" if ok else "Уже неактуально")
-    if ok and callback.message:
-        await callback.message.edit_text("Удалено ✅")
+    if callback.message:
+        try:
+            await callback.message.edit_text(result)
+        except Exception:
+            log.debug("Не удалось отредактировать сообщение удаления", exc_info=True)
 
 
 # --- текст и голос ----------------------------------------------------------

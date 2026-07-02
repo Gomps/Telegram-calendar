@@ -171,6 +171,13 @@ class Database:
         )
         return [dict(r) for r in await cur.fetchall()]
 
+    async def get_reminder(self, user_id: int, reminder_id: int) -> Optional[dict]:
+        cur = await self.db.execute(
+            "SELECT * FROM reminders WHERE id = ? AND user_id = ?", (reminder_id, user_id)
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
     async def cancel_reminder(self, user_id: int, reminder_id: int) -> bool:
         cur = await self.db.execute(
             "UPDATE reminders SET status = 'cancelled' "
@@ -206,6 +213,17 @@ class Database:
         for r in rows:
             r["rule"] = json.loads(r["rule_json"])
         return rows
+
+    async def get_series(self, user_id: int, series_id: int) -> Optional[dict]:
+        cur = await self.db.execute(
+            "SELECT * FROM series WHERE id = ? AND user_id = ?", (series_id, user_id)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        s = dict(row)
+        s["rule"] = json.loads(s["rule_json"])
+        return s
 
     async def set_series_cursor(self, series_id: int, fired_at_utc: datetime) -> None:
         await self.db.execute(
