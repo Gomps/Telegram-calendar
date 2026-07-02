@@ -116,13 +116,16 @@ def validate_action(data: dict) -> list[str]:
         if not str(data.get("reminder_text", "")).strip():
             errors.append("для create_reminder нужен reminder_text")
         fire_at = data.get("fire_at")
-        if not fire_at:
-            errors.append("для create_reminder нужен fire_at (YYYY-MM-DDTHH:MM)")
-        else:
+        expr = str(data.get("time_expression") or "").strip()
+        if fire_at:
             try:
                 datetime.fromisoformat(str(fire_at))
             except ValueError:
                 errors.append(f"fire_at «{fire_at}» не разбирается как YYYY-MM-DDTHH:MM")
+        elif not expr:
+            errors.append(
+                "для create_reminder нужен fire_at (YYYY-MM-DDTHH:MM) или time_expression"
+            )
 
     if action == "create_recurring":
         if not str(data.get("reminder_text", "")).strip():

@@ -5,6 +5,7 @@ workflow_data диспетчера (см. main.py).
 """
 
 import html as html_lib
+import json
 import logging
 import os
 import tempfile
@@ -21,6 +22,7 @@ from .llm import LLMBadResponse, LLMUnavailable, OllamaClient
 from .logbuffer import MemoryLogHandler, build_pages
 from .prompts import build_system_prompt
 from .rules import describe_rule, missing_context_keys, next_occurrence
+from .timeparse import parse_time_expression
 from .transcribe import Transcriber, TranscriptionError
 
 log = logging.getLogger(__name__)
@@ -392,7 +394,7 @@ async def process_text(
     """Конвейер обработки. Любой исход завершается заменой статусного
     сообщения на результирующий ответ — бот никогда не молчит."""
     try:
-        await _process_text(message, text, db, llm, cfg, bot, status, prefix)
+        await _process_text(message, text, db, llm, cfg, bot, status, prefix, depth=0)
     except Exception:
         log.exception("Необработанная ошибка конвейера (пользователь %d)", message.from_user.id)
         await status.finish(
@@ -410,6 +412,7 @@ async def _process_text(
     bot: Bot,
     status: StatusMessage,
     prefix: str,
+    depth: int,
 ) -> None:
     user = await db.get_or_create_user(message.from_user.id, message.chat.id, cfg.default_tz)
     user_id = user["user_id"]
@@ -447,14 +450,50 @@ async def _process_text(
         log.info("Пользователь %d: контекст обновлён %s", user_id, updates)
 
     kind = action["action"]
+
+    # Модель переспрашивает то, что уже есть в контексте, — один
+    # корректирующий повтор с явной подсказкой
+    if kind == "ask_clarification" and depth == 0:
+        missing = [str(k) for k in (action.get("missing_fields") or [])]
+        if missing and all(ctx.get(k) for k in missing):
+            known = {k: ctx[k] for k in missing}
+            log.info("LLM переспрашивает известные ключи %s — корректирующий повтор", missing)
+            hint = (
+                "\n\nВАЖНО: эти данные УЖЕ есть в контексте: "
+                + json.dumps(known, ensure_ascii=False)
+                + ". Не задавай уточняющий вопрос — выполни запрос, используя эти значения."
+            )
+            try:
+                action = await llm.parse_message(system_prompt + hint, text)
+                kind = action["action"]
+                new_updates = action.get("context_updates") or {}
+                if new_updates:
+                    ctx = await db.update_context(user_id, new_updates)
+                    updates = {**updates, **new_updates}
+            except (LLMUnavailable, LLMBadResponse):
+                pass  # остаёмся с исходным уточняющим вопросом
+
     if kind == "save_context":
         await db.clear_pending_clarification(user_id)
+        if pending and depth == 0:
+            # Ответ на уточнение сохранён — возвращаемся к исходному запросу,
+            # иначе он терялся бы («запомнил», а напоминание не создал)
+            saved_note = "; ".join(f"{k}: {v}" for k, v in updates.items())
+            new_prefix = prefix + (f"💾 Запомнил: {saved_note}\n\n" if saved_note else "")
+            await status.set(new_prefix + "⏳ Возвращаюсь к исходному запросу…")
+            log.info("Пользователь %d: возврат к исходному запросу «%s»",
+                     user_id, pending["original_request"])
+            await _process_text(
+                message, pending["original_request"], db, llm, cfg, bot,
+                status, new_prefix, depth=1,
+            )
+            return
         lines = [f"• {k}: {v}" for k, v in updates.items()]
         await status.finish(prefix + "✅ Запомнил:\n" + "\n".join(lines))
         return
 
     if kind == "create_reminder":
-        await handle_create_reminder(action, user, ctx, tz, db, status, prefix)
+        await handle_create_reminder(action, user, ctx, tz, db, status, prefix, text)
         return
 
     if kind == "create_recurring":
@@ -483,11 +522,33 @@ async def _process_text(
 
 async def handle_create_reminder(
     action: dict, user: dict, ctx: dict, tz: ZoneInfo, db: Database,
-    status: StatusMessage, prefix: str,
+    status: StatusMessage, prefix: str, raw_text: str,
 ) -> None:
-    fire_local = datetime.fromisoformat(str(action["fire_at"]))
-    if fire_local.tzinfo is None:
-        fire_local = fire_local.replace(tzinfo=tz)
+    now_local = datetime.now(timezone.utc).astimezone(tz)
+
+    # Этап «время»: сначала детерминированный парсер по дословному выражению
+    # («через 5 минут», «завтра в 9») — арифметику времени коду доверяем
+    # больше, чем маленькой модели; затем fire_at, вычисленный LLM
+    # (контекстные «после работы»)
+    fire_local = None
+    expr = str(action.get("time_expression") or "").strip()
+    if expr:
+        fire_local = parse_time_expression(expr, now_local)
+        if fire_local is not None:
+            log.info("Время из «%s» вычислено детерминированно: %s", expr, fire_local)
+    if fire_local is None and action.get("fire_at"):
+        fire_local = datetime.fromisoformat(str(action["fire_at"]))
+        if fire_local.tzinfo is None:
+            fire_local = fire_local.replace(tzinfo=tz)
+    if fire_local is None:
+        question = (
+            f"Не понял, когда напомнить («{expr}»). "
+            "Укажи время, например «в 16:30» или «через 20 минут»."
+        )
+        await db.set_pending_clarification(user["user_id"], raw_text, question)
+        await status.finish(prefix + "❓ " + question)
+        return
+
     fire_utc = fire_local.astimezone(timezone.utc)
     if fire_utc <= datetime.now(timezone.utc):
         await status.finish(
