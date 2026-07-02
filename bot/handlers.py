@@ -23,7 +23,7 @@ from .llm import LLMBadResponse, LLMUnavailable, OllamaClient
 from .logbuffer import MemoryLogHandler, build_pages
 from .prompts import build_system_prompt
 from .rules import describe_rule, missing_context_keys, next_occurrence, parse_hhmm
-from .timeparse import parse_time_expression
+from .timeparse import has_day_marker, parse_time_expression
 from .tzutil import city_to_tz, get_tz, offset_from_current_time, offset_tz_name
 from .transcribe import Transcriber, TranscriptionError
 
@@ -244,16 +244,21 @@ async def cmd_start(message: Message, db: Database, cfg: Config) -> None:
 async def cmd_context(message: Message, db: Database, cfg: Config) -> None:
     user = await db.get_or_create_user(message.from_user.id, message.chat.id, cfg.default_tz)
     ctx = user["context"]
+    now_local = datetime.now(get_tz(user["timezone"]))
+    dow = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+    clock = (
+        f"\n\n⏰ Моё время для тебя сейчас: {now_local.strftime('%d.%m.%Y %H:%M')}, "
+        f"{dow[now_local.weekday()]} ({user['timezone']}).\n"
+        "Если время неверное — напиши «У меня сейчас HH:MM», я пересчитаю пояс."
+    )
     if not ctx:
         await message.answer(
             "Я пока ничего не знаю о твоём распорядке. Расскажи, например:\n"
-            "«Я работаю с 9 до 18, сплю с 23 до 7»"
+            "«Я работаю с 9 до 18, сплю с 23 до 7»" + clock
         )
         return
     lines = [f"• {k}: {v}" for k, v in sorted(ctx.items())]
-    await message.answer(
-        "📋 Твой распорядок:\n" + "\n".join(lines) + f"\n\nЧасовой пояс: {user['timezone']}"
-    )
+    await message.answer("📋 Твой распорядок:\n" + "\n".join(lines) + clock)
 
 
 @router.message(Command("timezone"))
@@ -681,39 +686,41 @@ async def _process_text(
         await status.finish(prefix + msg)
         return
 
-    # Модель заменила слова напоминания (не просто опечатки) — переспрашиваем
     if kind in ("create_reminder", "create_recurring", "create_conditional"):
+        # Создаём запись СРАЗУ; если модель заменила слова пользователя —
+        # просим подтвердить: «Оставить» ничего не меняет, «Удалить» отменяет
+        if kind == "create_reminder":
+            msg, _stop, _fire, item_id = await _do_create_reminder(action, user, ctx, tz, db, text)
+            ref = ("r", item_id)
+        elif kind == "create_recurring":
+            msg, _stop, item_id = await _do_create_recurring(action, user, ctx, tz, db, text)
+            ref = ("s", item_id)
+        else:
+            msg, _stop, item_id = await _do_create_conditional(action, user, ctx, tz, db, text)
+            ref = ("c", item_id)
+
         reminder_text = str(action.get("reminder_text") or "").strip()
-        if reminder_text and not text_matches_source(reminder_text, text):
-            await db.set_pending_action(user_id, json.dumps(action, ensure_ascii=False), text)
+        if item_id is not None and reminder_text and not text_matches_source(reminder_text, text):
+            await db.set_pending_action(
+                user_id,
+                json.dumps({"undo": list(ref), "final_msg": msg}, ensure_ascii=False),
+                text,
+            )
             kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="✅ Да, верно", callback_data="confirm:yes"),
-                InlineKeyboardButton(text="✏️ Нет, не то", callback_data="confirm:no"),
+                InlineKeyboardButton(text="✅ Оставить", callback_data="confirm:yes"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data="confirm:no"),
             ]])
             log.info(
-                "Пользователь %d: текст напоминания «%s» не совпадает с сообщением — прошу подтвердить",
+                "Пользователь %d: текст «%s» не совпадает с сообщением — создано, прошу подтвердить",
                 user_id, reminder_text,
             )
             await status.finish(
-                prefix + "🤔 Хочу убедиться, что понял правильно.\n"
+                prefix + msg + "\n\n🤔 Хочу убедиться, что понял правильно.\n"
                 f"Ты написал: «{text}»\n"
-                f"Я понял напоминание как: «{reminder_text}»\n\nВсё верно?",
+                f"Я понял как: «{reminder_text}»\n\nОставить или удалить?",
                 reply_markup=kb,
             )
             return
-
-    if kind == "create_reminder":
-        msg, _stop, _fire = await _do_create_reminder(action, user, ctx, tz, db, text)
-        await status.finish(prefix + msg)
-        return
-
-    if kind == "create_recurring":
-        msg, _stop = await _do_create_recurring(action, user, ctx, tz, db, text)
-        await status.finish(prefix + msg)
-        return
-
-    if kind == "create_conditional":
-        msg, _stop = await _do_create_conditional(action, user, ctx, tz, db, text)
         await status.finish(prefix + msg)
         return
 
@@ -733,7 +740,7 @@ async def _process_text(
                     "✅ Запомнил: " + "; ".join(f"{k}: {v}" for k, v in sub_updates.items())
                 )
             elif skind == "create_reminder":
-                msg, stop, fire_utc = await _do_create_reminder(sub, user, ctx, tz, db, text)
+                msg, stop, fire_utc, _rid = await _do_create_reminder(sub, user, ctx, tz, db, text)
                 parts.append(msg)
                 if fire_utc is not None:
                     last_fire_utc = fire_utc
@@ -742,17 +749,19 @@ async def _process_text(
             elif skind == "create_recurring":
                 # серия не должна дублировать только что созданное разовое —
                 # её отсчёт начинается после него
-                msg, stop = await _do_create_recurring(
+                msg, stop, _sid = await _do_create_recurring(
                     sub, user, ctx, tz, db, text, skip_until=last_fire_utc
                 )
                 parts.append(msg)
                 if stop:
                     break
             elif skind == "create_conditional":
-                msg, stop = await _do_create_conditional(sub, user, ctx, tz, db, text)
+                msg, stop, _cid = await _do_create_conditional(sub, user, ctx, tz, db, text)
                 parts.append(msg)
                 if stop:
                     break
+            elif skind == "set_timezone":
+                parts.append(await _do_set_timezone(sub, user_id, db))
         await status.finish(
             prefix
             + ("\n\n".join(parts) if parts else "Не понял запрос — попробуй сформулировать иначе.")
@@ -798,10 +807,10 @@ def _resolve_time(expr: str, iso_value, now_local: datetime, tz: ZoneInfo) -> da
 
 async def _do_create_reminder(
     action: dict, user: dict, ctx: dict, tz: ZoneInfo, db: Database, raw_text: str
-) -> tuple[str, bool, datetime | None]:
+) -> tuple[str, bool, datetime | None, int | None]:
     """Создаёт разовое напоминание.
 
-    Возвращает (текст ответа, прервать_ли_дальнейшую_обработку, время UTC).
+    Возвращает (текст ответа, прервать_ли_обработку, время UTC, id записи).
     """
     now_local = datetime.now(timezone.utc).astimezone(tz)
     expr = str(action.get("time_expression") or "").strip()
@@ -813,7 +822,7 @@ async def _do_create_reminder(
             "например «завтра в 9», «в 16:30» или «через 20 минут»."
         )
         await db.set_pending_clarification(user["user_id"], raw_text, question)
-        return "❓ " + question, True, None
+        return "❓ " + question, True, None, None
 
     fire_utc = fire_local.astimezone(timezone.utc)
     if fire_utc <= datetime.now(timezone.utc):
@@ -821,6 +830,7 @@ async def _do_create_reminder(
             f"Похоже, это время уже прошло ({fire_local.strftime('%d.%m.%Y %H:%M')}). "
             "Уточни, когда напомнить?",
             True,
+            None,
             None,
         )
     reminder_id = await db.add_reminder(
@@ -832,15 +842,16 @@ async def _do_create_reminder(
         f"✅ Напомню: «{action['reminder_text'].strip()}»\n🕐 {fmt_local(fire_utc, tz)}",
         False,
         fire_utc,
+        reminder_id,
     )
 
 
 async def _do_create_conditional(
     action: dict, user: dict, ctx: dict, tz: ZoneInfo, db: Database, raw_text: str
-) -> tuple[str, bool]:
+) -> tuple[str, bool, int | None]:
     """Условное напоминание: в check_at бот задаст condition_question с
     кнопками Да/Нет; «Да» до fire_at создаёт напоминание, иначе условие
-    истекает. Возвращает (текст ответа, прервать_ли_обработку)."""
+    истекает. Возвращает (текст ответа, прервать_ли_обработку, id записи)."""
     now_local = datetime.now(timezone.utc).astimezone(tz)
     question = str(action.get("condition_question") or "").strip()
     reminder_text = str(action.get("reminder_text") or "").strip()
@@ -852,25 +863,32 @@ async def _do_create_conditional(
     if check_local is None:
         q = f"Когда проверить условие «{question}»? Укажи дату и время."
         await db.set_pending_clarification(user["user_id"], raw_text, q)
-        return "❓ " + q, True
+        return "❓ " + q, True, None
 
-    fire_local = _resolve_time(
-        str(action.get("time_expression") or "").strip(),
-        action.get("fire_at"), now_local, tz,
-    )
+    fire_expr = str(action.get("time_expression") or "").strip()
+    fire_local = _resolve_time(fire_expr, action.get("fire_at"), now_local, tz)
     if fire_local is None:
         q = (
             f"Когда напомнить «{reminder_text}», если условие подтвердится? "
             "Укажи дату и время."
         )
         await db.set_pending_clarification(user["user_id"], raw_text, q)
-        return "❓ " + q, True
+        return "❓ " + q, True, None
+
+    # «Если проснусь в субботу в 12:00 — напомни в 14:00»: время без указания
+    # дня относится к дню условия, а не к ближайшему будущему от «сейчас»
+    if fire_local <= check_local and fire_expr and not has_day_marker(fire_expr):
+        inherited = parse_time_expression(fire_expr, check_local)
+        if inherited is not None:
+            log.info("Время «%s» унаследовало день условия: %s", fire_expr, inherited)
+            fire_local = inherited
 
     if check_local <= now_local:
         return (
             f"Время проверки условия уже прошло ({check_local.strftime('%d.%m.%Y %H:%M')}). "
             "Уточни, когда задать вопрос?",
             True,
+            None,
         )
     if fire_local <= check_local:
         return (
@@ -878,6 +896,7 @@ async def _do_create_conditional(
             f"(вопрос в {check_local.strftime('%H:%M')}, напоминание в "
             f"{fire_local.strftime('%H:%M')}). Уточни времена?",
             True,
+            None,
         )
 
     check_utc = check_local.astimezone(timezone.utc)
@@ -892,12 +911,14 @@ async def _do_create_conditional(
         f"Если подтвердишь до {fmt_local(fire_utc, tz)} — напомню: «{reminder_text}». "
         "Без ответа напоминание не создаётся.",
         False,
+        cond_id,
     )
 
 
 @router.callback_query(F.data.startswith("confirm:"))
 async def cb_confirm(callback: CallbackQuery, db: Database, cfg: Config) -> None:
-    """Подтверждение действия, в котором LLM могла исказить текст напоминания."""
+    """Ответ на «оставить или удалить?»: запись уже создана — «Оставить»
+    ничего не меняет, «Удалить» отменяет созданное."""
     user_id = callback.from_user.id
     pa = await db.get_pending_action(user_id)
     if pa is None:
@@ -905,34 +926,27 @@ async def cb_confirm(callback: CallbackQuery, db: Database, cfg: Config) -> None
         return
     await db.clear_pending_action(user_id)
 
-    if callback.data.split(":")[1] == "no":
-        await callback.answer("Ок")
-        if callback.message:
-            try:
-                await callback.message.edit_text(
-                    "Ок, отменил. Сформулируй, пожалуйста, ещё раз — что и когда напомнить?"
-                )
-            except Exception:
-                log.debug("Не удалось отредактировать подтверждение", exc_info=True)
+    data = json.loads(pa["action_json"])
+    undo = data.get("undo")
+    if not undo:
+        await callback.answer("Уже неактуально")
         return
+    ref_kind, item_id = undo[0], int(undo[1])
 
-    action = json.loads(pa["action_json"])
-    raw_text = pa["original_text"]
-    chat_id = callback.message.chat.id if callback.message else user_id
-    user = await db.get_or_create_user(user_id, chat_id, cfg.default_tz)
-    tz = get_tz(user["timezone"])
-    ctx = user["context"]
-
-    kind = action.get("action")
-    if kind == "create_reminder":
-        result, _stop, _fire = await _do_create_reminder(action, user, ctx, tz, db, raw_text)
-    elif kind == "create_recurring":
-        result, _stop = await _do_create_recurring(action, user, ctx, tz, db, raw_text)
-    elif kind == "create_conditional":
-        result, _stop = await _do_create_conditional(action, user, ctx, tz, db, raw_text)
+    if callback.data.split(":")[1] == "no":
+        if ref_kind == "r":
+            await db.cancel_reminder(user_id, item_id)
+        elif ref_kind == "s":
+            await db.deactivate_series(user_id, item_id)
+        else:
+            await db.cancel_conditional(user_id, item_id)
+        log.info("Пользователь %d отменил созданное по подтверждению (%s%d)", user_id, ref_kind, item_id)
+        await callback.answer("Удалено")
+        result = "🗑 Удалил. Сформулируй, пожалуйста, ещё раз — что и когда напомнить?"
     else:
-        result = "Не смог выполнить подтверждённое действие — попробуй сформулировать заново."
-    await callback.answer("Подтверждено ✅")
+        await callback.answer("Оставил ✅")
+        result = data.get("final_msg", "✅ Оставил как есть.")
+
     if callback.message:
         try:
             await callback.message.edit_text(result)
@@ -984,7 +998,7 @@ async def cb_conditional(callback: CallbackQuery, db: Database) -> None:
 async def _do_create_recurring(
     action: dict, user: dict, ctx: dict, tz: ZoneInfo, db: Database, raw_text: str,
     skip_until: datetime | None = None,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, int | None]:
     """Создаёт периодическую серию.
 
     skip_until — не срабатывать до этого момента (UTC): в multi серия не
@@ -1003,7 +1017,7 @@ async def _do_create_recurring(
         }
         question = questions.get(missing[0], f"Уточни время «{missing[0]}» (HH:MM)?")
         await db.set_pending_clarification(user["user_id"], raw_text, question)
-        return "❓ " + question, True
+        return "❓ " + question, True, None
 
     series_id = await db.add_series(
         user["user_id"], user["chat_id"], action["reminder_text"].strip(), rule
@@ -1021,4 +1035,5 @@ async def _do_create_recurring(
         f"📅 {describe_rule(rule, ctx)}{nxt_s}\n"
         "При изменении распорядка расписание пересчитается автоматически.",
         False,
+        series_id,
     )

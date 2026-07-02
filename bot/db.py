@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS conditionals (
     fire_at       TEXT    NOT NULL,   -- UTC: когда напомнить при подтверждении
     -- pending -> asked -> confirmed | declined | expired | cancelled
     status        TEXT    NOT NULL DEFAULT 'pending',
+    ask_message_id INTEGER,           -- id сообщения-вопроса (для удаления по истечении)
     created_at    TEXT    NOT NULL
 );
 
@@ -93,7 +94,17 @@ class Database:
         self._db = await aiosqlite.connect(self.path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(SCHEMA)
+        await self._migrate()
         await self._db.commit()
+
+    async def _migrate(self) -> None:
+        """Догоняющие миграции для баз, созданных старыми версиями схемы."""
+        cur = await self._db.execute("PRAGMA table_info(conditionals)")
+        columns = {row["name"] for row in await cur.fetchall()}
+        if "ask_message_id" not in columns:
+            await self._db.execute(
+                "ALTER TABLE conditionals ADD COLUMN ask_message_id INTEGER"
+            )
 
     async def close(self) -> None:
         if self._db:
@@ -302,6 +313,12 @@ class Database:
     async def set_conditional_status(self, cond_id: int, status: str) -> None:
         await self.db.execute(
             "UPDATE conditionals SET status = ? WHERE id = ?", (status, cond_id)
+        )
+        await self.db.commit()
+
+    async def set_conditional_ask_message(self, cond_id: int, message_id: int) -> None:
+        await self.db.execute(
+            "UPDATE conditionals SET ask_message_id = ? WHERE id = ?", (message_id, cond_id)
         )
         await self.db.commit()
 

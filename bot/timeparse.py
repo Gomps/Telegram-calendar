@@ -54,6 +54,20 @@ def parse_time_expression(expr: str, now: datetime) -> Optional[datetime]:
     return result
 
 
+def has_day_marker(expr: str) -> bool:
+    """Есть ли в выражении указание дня (дата, день недели, «завтра», «через…»).
+
+    «в 14:00» — нет дня; «в субботу в 14:00» — есть. Нужно, чтобы в условных
+    напоминаниях время без дня наследовало день условия.
+    """
+    s = " ".join(str(expr).lower().replace("ё", "е").split())
+    if any(w in s for w in ("сегодня", "завтра", "послезавтра", "через")):
+        return True
+    if re.search(r"\d{1,2}\s+(" + "|".join(MONTHS) + r")", s):
+        return True
+    return any(re.search(r"\b" + name + r"\b", s) for name in WEEKDAYS)
+
+
 def _parse_relative(s: str) -> Optional[timedelta]:
     """«через 5 минут», «через час», «через полчаса», «через 2 часа 15 минут»."""
     if "через" not in s:

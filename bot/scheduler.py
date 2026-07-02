@@ -112,13 +112,14 @@ class ReminderScheduler:
                     InlineKeyboardButton(text="✅ Да", callback_data=f"cond:yes:{c['id']}"),
                     InlineKeyboardButton(text="❌ Нет", callback_data=f"cond:no:{c['id']}"),
                 ]])
-                await self.bot.send_message(
+                sent = await self.bot.send_message(
                     c["chat_id"],
                     f"❓ {c['question']}\n\nЕсли ответишь «Да» до {fmt_local(fire_at, tz)}, "
                     f"напомню: «{c['reminder_text']}».",
                     reply_markup=kb,
                 )
                 await self.db.set_conditional_status(c["id"], "asked")
+                await self.db.set_conditional_ask_message(c["id"], sent.message_id)
                 log.info("Условное #%d: вопрос задан", c["id"])
             except Exception:
                 log.exception("Ошибка вопроса условия #%d", c["id"])
@@ -127,12 +128,20 @@ class ReminderScheduler:
         for c in await self.db.expired_conditionals(now):
             try:
                 await self.db.set_conditional_status(c["id"], "expired")
+                # устаревший вопрос с кнопками удаляем, чтобы не висел в чате
+                if c.get("ask_message_id"):
+                    try:
+                        await self.bot.delete_message(c["chat_id"], c["ask_message_id"])
+                    except Exception:
+                        log.debug(
+                            "Не удалось удалить вопрос условия #%d", c["id"], exc_info=True
+                        )
                 await self.bot.send_message(
                     c["chat_id"],
                     f"⏳ Вопрос «{c['question']}» остался без ответа — "
                     f"напоминание «{c['reminder_text']}» не создано.",
                 )
-                log.info("Условное #%d истекло без ответа", c["id"])
+                log.info("Условное #%d истекло без ответа, вопрос удалён", c["id"])
             except Exception:
                 log.exception("Ошибка истечения условия #%d", c["id"])
 
