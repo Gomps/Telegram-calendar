@@ -45,6 +45,19 @@ CREATE TABLE IF NOT EXISTS series (
     created_at    TEXT    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS conditionals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL,
+    chat_id       INTEGER NOT NULL,
+    question      TEXT    NOT NULL,   -- вопрос условия («Ты не спишь?»)
+    reminder_text TEXT    NOT NULL,
+    check_at      TEXT    NOT NULL,   -- UTC: когда задать вопрос
+    fire_at       TEXT    NOT NULL,   -- UTC: когда напомнить при подтверждении
+    -- pending -> asked -> confirmed | declined | expired | cancelled
+    status        TEXT    NOT NULL DEFAULT 'pending',
+    created_at    TEXT    NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS allowed_users (
     user_id    INTEGER PRIMARY KEY,
     added_by   INTEGER NOT NULL,
@@ -236,6 +249,67 @@ class Database:
         cur = await self.db.execute(
             "UPDATE series SET active = 0 WHERE id = ? AND user_id = ? AND active = 1",
             (series_id, user_id),
+        )
+        await self.db.commit()
+        return cur.rowcount > 0
+
+    # --- условные напоминания ------------------------------------------------------
+
+    async def add_conditional(
+        self, user_id: int, chat_id: int, question: str, reminder_text: str,
+        check_at_utc: datetime, fire_at_utc: datetime,
+    ) -> int:
+        cur = await self.db.execute(
+            "INSERT INTO conditionals (user_id, chat_id, question, reminder_text, "
+            "check_at, fire_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, chat_id, question, reminder_text,
+             check_at_utc.isoformat(timespec="seconds"),
+             fire_at_utc.isoformat(timespec="seconds"), utcnow_iso()),
+        )
+        await self.db.commit()
+        return cur.lastrowid
+
+    async def due_conditionals(self, now_utc: datetime) -> list[dict]:
+        """Условия, по которым пора задать вопрос."""
+        cur = await self.db.execute(
+            "SELECT * FROM conditionals WHERE status = 'pending' AND check_at <= ?",
+            (now_utc.isoformat(timespec="seconds"),),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def expired_conditionals(self, now_utc: datetime) -> list[dict]:
+        """Заданные вопросы, на которые не ответили до целевого времени."""
+        cur = await self.db.execute(
+            "SELECT * FROM conditionals WHERE status = 'asked' AND fire_at <= ?",
+            (now_utc.isoformat(timespec="seconds"),),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def get_conditional(self, user_id: int, cond_id: int) -> Optional[dict]:
+        cur = await self.db.execute(
+            "SELECT * FROM conditionals WHERE id = ? AND user_id = ?", (cond_id, user_id)
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def set_conditional_status(self, cond_id: int, status: str) -> None:
+        await self.db.execute(
+            "UPDATE conditionals SET status = ? WHERE id = ?", (status, cond_id)
+        )
+        await self.db.commit()
+
+    async def list_user_conditionals(self, user_id: int) -> list[dict]:
+        cur = await self.db.execute(
+            "SELECT * FROM conditionals WHERE user_id = ? AND status IN ('pending', 'asked')",
+            (user_id,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+    async def cancel_conditional(self, user_id: int, cond_id: int) -> bool:
+        cur = await self.db.execute(
+            "UPDATE conditionals SET status = 'cancelled' "
+            "WHERE id = ? AND user_id = ? AND status IN ('pending', 'asked')",
+            (cond_id, user_id),
         )
         await self.db.commit()
         return cur.rowcount > 0

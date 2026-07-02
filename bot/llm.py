@@ -16,7 +16,10 @@ from .rules import normalize_hhmm, parse_hhmm, validate_rule
 
 log = logging.getLogger(__name__)
 
-ACTIONS = {"save_context", "create_reminder", "create_recurring", "ask_clarification", "not_a_reminder"}
+ACTIONS = {
+    "save_context", "create_reminder", "create_recurring", "create_conditional",
+    "ask_clarification", "not_a_reminder",
+}
 
 
 class LLMUnavailable(Exception):
@@ -84,21 +87,22 @@ def normalize_action(data: dict) -> dict:
                 if norm is not None:
                     anchor["time"] = norm
 
-    fire_at = data.get("fire_at")
-    if isinstance(fire_at, str):
-        # «2026-07-03T16.30» / «2026-07-03 16-30» -> «2026-07-03T16:30».
-        # Чинить надо ДО fromisoformat: Python разбирает «T16.30» как
-        # 16:00:00.300000 (доли часа) — напоминание молча встало бы не на то время.
-        fixed = re.sub(
-            r"[T ]\s*(\d{1,2})[.\-](\d{2})\s*$",
-            lambda m: f"T{int(m.group(1)):02d}:{m.group(2)}",
-            fire_at.strip(),
-        )
-        try:
-            datetime.fromisoformat(fixed)
-            data["fire_at"] = fixed
-        except ValueError:
-            pass
+    for field in ("fire_at", "check_at"):
+        value = data.get(field)
+        if isinstance(value, str):
+            # «2026-07-03T16.30» / «2026-07-03 16-30» -> «2026-07-03T16:30».
+            # Чинить надо ДО fromisoformat: Python разбирает «T16.30» как
+            # 16:00:00.300000 (доли часа) — время молча встало бы не то.
+            fixed = re.sub(
+                r"[T ]\s*(\d{1,2})[.\-](\d{2})\s*$",
+                lambda m: f"T{int(m.group(1)):02d}:{m.group(2)}",
+                value.strip(),
+            )
+            try:
+                datetime.fromisoformat(fixed)
+                data[field] = fixed
+            except ValueError:
+                pass
     return data
 
 
@@ -156,6 +160,24 @@ def validate_action(data: dict, allow_multi: bool = True) -> list[str]:
         if not str(data.get("reminder_text", "")).strip():
             errors.append("для create_recurring нужен reminder_text")
         errors.extend(validate_rule(data.get("recurring", {})))
+
+    if action == "create_conditional":
+        if not str(data.get("condition_question", "")).strip():
+            errors.append("для create_conditional нужен condition_question")
+        if not str(data.get("reminder_text", "")).strip():
+            errors.append("для create_conditional нужен reminder_text")
+        for iso_field, expr_field in (
+            ("check_at", "check_time_expression"),
+            ("fire_at", "time_expression"),
+        ):
+            iso_value = data.get(iso_field)
+            if iso_value:
+                try:
+                    datetime.fromisoformat(str(iso_value))
+                except ValueError:
+                    errors.append(f"{iso_field} «{iso_value}» не разбирается как YYYY-MM-DDTHH:MM")
+            elif not str(data.get(expr_field) or "").strip():
+                errors.append(f"для create_conditional нужен {iso_field} или {expr_field}")
 
     if action == "ask_clarification":
         if not str(data.get("clarification_question", "")).strip():

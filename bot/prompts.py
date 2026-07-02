@@ -29,7 +29,10 @@ SCHEMA = """\
     "end_anchor": { так же }                      // для interval
   },
   "clarification_question": "один короткий вопрос", // для ask_clarification
-  "missing_fields": ["work_end"]                    // для ask_clarification
+  "missing_fields": ["work_end"],                   // для ask_clarification
+  "condition_question": "Ты не спишь?",             // для create_conditional: вопрос, который бот задаст в момент проверки
+  "check_time_expression": "завтра в 11:30",        // для create_conditional: КОГДА задать вопрос (дословно из сообщения)
+  "check_at": "YYYY-MM-DDTHH:MM"                    // для create_conditional: вычисленное время вопроса
 }
 
 Стандартные ключи контекста: work_start, work_end, sleep_start, sleep_end (формат HH:MM).
@@ -48,10 +51,12 @@ RULES = """\
 9. Разбирай сообщение на составляющие: служебные слова («напомни», «поставь», «пожалуйста») отбрасывай; выражение времени («через 5 минут», «завтра в 9», «после работы») копируй ДОСЛОВНО в time_expression; оставшуюся суть — в reminder_text. fire_at всё равно вычисляй — бот перепроверит время по time_expression.
 10. НЕ задавай уточняющий вопрос о данных, которые уже есть в контексте (например, work_end известен) — просто используй их.
 11. create_recurring — ТОЛЬКО при явных признаках повторения: «каждый/каждые», «ежедневно», «по понедельникам», «раз в …». Без таких слов («через 5 минут», «завтра в 9») — всегда РАЗОВОЕ create_reminder, даже если дел несколько.
-12. Если просят и разовое, и периодическое («напомни через час, а потом каждый день») — верни action=multi со списком actions: сначала create_reminder, затем create_recurring. Время серии бери из разового (напоминание в 15:00 → серия daily в 15:00)."""
+12. Если просят и разовое, и периодическое («напомни через час, а потом каждый день») — верни action=multi со списком actions: сначала create_reminder, затем create_recurring. Время серии бери из разового (напоминание в 15:00 → серия daily в 15:00).
+13. Условное напоминание «Если <условие в момент X> — напомни <дело> в Y» -> action=create_conditional: в check_* — время проверки условия, в condition_question — короткий вопрос пользователю по условию (от второго лица), reminder_text/time_expression/fire_at — само напоминание. Время напоминания должно быть ПОЗЖЕ времени проверки.
+14. clarification_question всегда включает суть напоминания, а не общий вопрос: не «Во сколько напомнить?», а «Когда напомнить полить цветы? Укажи дату и время»."""
 
 EXAMPLES = """\
-Примеры (сегодня четверг 2026-07-02, контекст: {"work_start": "09:00", "work_end": "18:00", "sleep_start": "23:00"}):
+Примеры (сегодня четверг 2026-07-02, контекст: {"work_start": "09:00", "work_end": "18:00", "sleep_start": "23:00", "lunch_end": "13:00"}):
 
 Сообщение: «Я работаю с 9 до 18, сплю с 23 до 7»
 Ответ: {"action": "save_context", "context_updates": {"work_start": "09:00", "work_end": "18:00", "sleep_start": "23:00", "sleep_end": "07:00"}}
@@ -75,7 +80,13 @@ EXAMPLES = """\
 Ответ: {"action": "multi", "actions": [{"action": "create_reminder", "reminder_text": "Полить цветы", "time_expression": "через час", "fire_at": "2026-07-02T15:00"}, {"action": "create_recurring", "reminder_text": "Полить цветы", "recurring": {"type": "daily", "days_of_week": null, "time": "15:00"}}]}
 
 Сообщение: «Напомни 15 августа поздравить маму»
-Ответ: {"action": "ask_clarification", "clarification_question": "Во сколько 15 августа напомнить?", "missing_fields": ["time"]}
+Ответ: {"action": "ask_clarification", "clarification_question": "Во сколько 15 августа напомнить поздравить маму?", "missing_fields": ["time"]}
+
+Сообщение: «Напомни полить цветы»
+Ответ: {"action": "ask_clarification", "clarification_question": "Когда напомнить полить цветы? Укажи дату и время.", "missing_fields": ["time"]}
+
+Сообщение: «Если в 11.30 завтра не буду спать — напомни после обеда выпить таблетку»
+Ответ: {"action": "create_conditional", "condition_question": "Ты не спишь?", "check_time_expression": "завтра в 11:30", "check_at": "2026-07-03T11:30", "reminder_text": "Выпить таблетку", "time_expression": "после обеда", "fire_at": "2026-07-03T13:00"}
 
 Сообщение: «Напоминай мне после работы каждый час пить воду, и так до двух часов до сна»
 Ответ: {"action": "create_recurring", "reminder_text": "Выпить воду", "recurring": {"type": "interval", "days_of_week": null, "interval_minutes": 60, "start_anchor": {"kind": "context", "key": "work_end", "offset_minutes": 0}, "end_anchor": {"kind": "context", "key": "sleep_start", "offset_minutes": -120}}}

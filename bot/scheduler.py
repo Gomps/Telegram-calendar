@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .config import Config
 from .db import Database
@@ -63,6 +64,7 @@ class ReminderScheduler:
         now = datetime.now(timezone.utc)
         await self._process_one_off(now)
         await self._process_series(now)
+        await self._process_conditionals(now)
 
     # --- разовые ---------------------------------------------------------
 
@@ -85,6 +87,52 @@ class ReminderScheduler:
                 log.info("Отправлено напоминание #%d пользователю %d", r["id"], r["user_id"])
             except Exception:
                 log.exception("Не удалось отправить напоминание #%d, повтор на следующем тике", r["id"])
+
+    # --- условные ---------------------------------------------------------
+
+    async def _process_conditionals(self, now: datetime) -> None:
+        # пора задать вопрос условия
+        for c in await self.db.due_conditionals(now):
+            try:
+                fire_at = datetime.fromisoformat(c["fire_at"])
+                tz_name, _ = await self.db.get_user_tz_and_context(c["user_id"])
+                tz = ZoneInfo(tz_name)
+                if fire_at <= now:
+                    # бот проспал всё окно условия — вопрос задавать поздно
+                    await self.db.set_conditional_status(c["id"], "expired")
+                    await self.bot.send_message(
+                        c["chat_id"],
+                        f"⏳ Пока бот был недоступен, прошло окно условия «{c['question']}» — "
+                        f"напоминание «{c['reminder_text']}» не создано.",
+                    )
+                    continue
+                kb = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="✅ Да", callback_data=f"cond:yes:{c['id']}"),
+                    InlineKeyboardButton(text="❌ Нет", callback_data=f"cond:no:{c['id']}"),
+                ]])
+                await self.bot.send_message(
+                    c["chat_id"],
+                    f"❓ {c['question']}\n\nЕсли ответишь «Да» до {fmt_local(fire_at, tz)}, "
+                    f"напомню: «{c['reminder_text']}».",
+                    reply_markup=kb,
+                )
+                await self.db.set_conditional_status(c["id"], "asked")
+                log.info("Условное #%d: вопрос задан", c["id"])
+            except Exception:
+                log.exception("Ошибка вопроса условия #%d", c["id"])
+
+        # вопрос задан, но ответа до целевого времени не было
+        for c in await self.db.expired_conditionals(now):
+            try:
+                await self.db.set_conditional_status(c["id"], "expired")
+                await self.bot.send_message(
+                    c["chat_id"],
+                    f"⏳ Вопрос «{c['question']}» остался без ответа — "
+                    f"напоминание «{c['reminder_text']}» не создано.",
+                )
+                log.info("Условное #%d истекло без ответа", c["id"])
+            except Exception:
+                log.exception("Ошибка истечения условия #%d", c["id"])
 
     # --- серии -----------------------------------------------------------
 
