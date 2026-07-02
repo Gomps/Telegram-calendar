@@ -344,9 +344,7 @@ async def on_voice(
         text = await transcriber.transcribe(tmp_path)
     except TranscriptionError as e:
         log.warning("Транскрибация не удалась: %s", e)
-        await status.finish(
-            "😔 Не удалось распознать голосовое сообщение. Попробуй ещё раз или напиши текстом."
-        )
+        await status.finish(f"😔 Не удалось распознать голосовое сообщение: {e}")
         return
     except Exception:
         log.exception("Ошибка обработки голосового сообщения")
@@ -354,7 +352,11 @@ async def on_voice(
         return
     finally:
         if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                # Windows: файл может быть ещё занят (антивирус/индексатор)
+                log.debug("Не удалось удалить временный файл %s", tmp_path, exc_info=True)
     await process_text(message, text, db, llm, cfg, bot, status, prefix=f"🎙 «{text}»\n\n")
 
 

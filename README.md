@@ -191,10 +191,44 @@ python -m bot.main
 удаляется и отправляется новое). Бот никогда не оставляет сообщение без
 ответа: любая внутренняя ошибка тоже показывается пользователю.
 
-> **Windows:** пакет `tzdata` обязателен — в Windows нет системной базы
-> часовых поясов IANA, без него любое сообщение падает с
-> `ZoneInfoNotFoundError: No time zone found with key Europe/Minsk`.
-> Он входит в `requirements.txt`; отдельно: `pip install tzdata`.
+## Запуск на Windows
+
+Всё проверено под Windows, порядок такой (PowerShell):
+
+```powershell
+# 1. Python 3.11+ с python.org (при установке отметить "Add python.exe to PATH")
+
+# 2. ffmpeg — нужен Whisper'у для голосовых
+winget install Gyan.FFmpeg
+# после установки перезапустить терминал; проверка: ffmpeg -version
+
+# 3. Ollama — установщик с https://ollama.com/download/windows, затем:
+ollama pull qwen3.5:4b
+
+# 4. Проект
+cd Telegram-calendar
+python -m venv .venv
+.venv\Scripts\Activate.ps1        # в cmd: .venv\Scripts\activate.bat
+pip install -r requirements.txt
+copy .env.example .env            # вписать BOT_TOKEN и ADMIN_USER_IDS
+
+# 5. Запуск
+python -m bot.main
+```
+
+Особенности Windows, уже учтённые в коде:
+
+- **`tzdata` обязателен** (есть в `requirements.txt`) — в Windows нет
+  системной базы часовых поясов IANA; без него каждое сообщение падало бы
+  с `ZoneInfoNotFoundError`. Бот проверяет это при старте.
+- **ffmpeg проверяется при старте и перед транскрибацией** — если его нет
+  в PATH, бот предупреждает в логе, а на голосовое отвечает понятной
+  ошибкой (текстовые сообщения работают и без ffmpeg).
+- **Первый запрос к LLM может идти минуты** — модель грузится в память;
+  таймаут настраивается (`LLM_TIMEOUT`, по умолчанию 180 с).
+- Остановка по `Ctrl+C` — штатная, без трейсбека; лог-файл пишется в
+  UTF-8; пути и удаление временных файлов голосовых устойчивы к блокировкам
+  файлов антивирусом.
 
 ## Диагностика («бот молчит / ничего не сохранилось»)
 

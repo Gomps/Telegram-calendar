@@ -37,6 +37,9 @@ class Config:
     log_file: str
     poll_interval: int
     llm_retries: int
+    # Таймаут запроса к Ollama, сек. Холодная загрузка модели на CPU
+    # (особенно под Windows) может занимать минуты — не занижайте.
+    llm_timeout: float
     # Насколько поздно (сек) напоминание ещё считается «вовремя», а не просроченным
     overdue_threshold: int
     # Пропущенное срабатывание серии старше этого (сек) не отправляется, а считается пропущенным
@@ -61,6 +64,7 @@ def load_config() -> Config:
         log_file=os.getenv("LOG_FILE", "data/bot.log").strip(),
         poll_interval=int(os.getenv("POLL_INTERVAL", "15")),
         llm_retries=int(os.getenv("LLM_RETRIES", "3")),
+        llm_timeout=float(os.getenv("LLM_TIMEOUT", "180")),
         overdue_threshold=int(os.getenv("OVERDUE_THRESHOLD", "120")),
         series_grace=int(os.getenv("SERIES_GRACE", "900")),
     )

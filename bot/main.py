@@ -4,6 +4,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+import shutil
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import Bot, Dispatcher
@@ -58,7 +59,15 @@ async def main() -> None:
     await db.connect()
     log.info("БД подключена: %s", cfg.db_path)
 
-    llm = OllamaClient(cfg.ollama_url, cfg.ollama_model, retries=cfg.llm_retries)
+    if shutil.which("ffmpeg") is None:
+        log.warning(
+            "ffmpeg не найден в PATH — голосовые сообщения не будут распознаваться "
+            "(Windows: winget install Gyan.FFmpeg; Linux: sudo apt install ffmpeg)"
+        )
+
+    llm = OllamaClient(
+        cfg.ollama_url, cfg.ollama_model, retries=cfg.llm_retries, timeout=cfg.llm_timeout
+    )
     server_ok, model_ok = await llm.healthcheck()
     if not server_ok:
         log.warning(
@@ -108,4 +117,8 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # штатная остановка по Ctrl+C (на Windows иначе сыплется трейсбек)
+        logging.getLogger(__name__).info("Бот остановлен")

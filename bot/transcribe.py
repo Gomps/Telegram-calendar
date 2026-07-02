@@ -7,6 +7,7 @@
 
 import asyncio
 import logging
+import shutil
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -35,6 +36,12 @@ class Transcriber:
         return self._model
 
     async def transcribe(self, path: str, language: Optional[str] = None) -> str:
+        # Whisper читает аудио через ffmpeg; без него ошибка была бы невнятной
+        if shutil.which("ffmpeg") is None:
+            raise TranscriptionError(
+                "ffmpeg не найден в PATH. Установи его и перезапусти бота "
+                "(Windows: winget install Gyan.FFmpeg; Linux: sudo apt install ffmpeg)"
+            )
         model = await self._get_model()
         try:
             result = await asyncio.to_thread(
