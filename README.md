@@ -3,8 +3,10 @@
 Бот принимает текстовые и голосовые сообщения на естественном языке, понимает
 относительное время («после работы», «за два часа до сна») на основе
 сохранённого распорядка пользователя и доставляет напоминания точно в срок.
-Понимание языка — локальная LLM **qwen3.5:4b** через Ollama, распознавание
-речи — **Whisper (medium)**, хранение — **SQLite**.
+Понимание языка — LLM через **любой OpenAI-совместимый API** (по умолчанию
+бесплатный **NVIDIA NIM**, `meta/llama-3.3-70b-instruct`; локальная Ollama
+тоже поддерживается), распознавание речи — облачный **whisper-large-v3**
+(например, бесплатный Groq) или локальный Whisper, хранение — **SQLite**.
 
 ## Возможности
 
@@ -67,7 +69,7 @@ bot/
 ├── main.py        # точка входа: DI, запуск поллинга и планировщика
 ├── config.py      # конфигурация из .env
 ├── handlers.py    # команды, текст/голос, диспетчеризация действий LLM
-├── llm.py         # клиент Ollama: JSON-режим, валидация схемы, ретраи
+├── llm.py         # OpenAI-совместимый LLM-клиент: валидация схемы, ретраи
 ├── prompts.py     # системный промпт: дата/время, TZ, контекст, few-shot
 ├── rules.py       # движок правил серий: якоря, срабатывания, валидация
 ├── timeparse.py   # детерминированный разбор «через 5 минут», «завтра в 9»…
@@ -78,7 +80,7 @@ bot/
 
 ### Разделение ответственности
 
-| Детеминированный код | LLM (qwen3.5:4b) |
+| Детеминированный код | LLM (через API) |
 |---|---|
 | приём сообщений, транскрибация | извлечение сути и времени из текста |
 | валидация JSON и правил серий | преобразование относительного времени по контексту |
@@ -121,7 +123,7 @@ LLM возвращает `multi` со списком действий (разо�
 
 ### Ключевые решения
 
-- **aiogram 3** — полностью асинхронный фреймворк: HTTP-вызовы Ollama и
+- **aiogram 3** — полностью асинхронный фреймворк: HTTP-вызовы LLM API и
   ожидание Telegram не блокируют друг друга, встроенное DI внедряет
   зависимости в обработчики, маршрутизация фильтрами (`F.voice`, `Command`)
   чище, чем у python-telegram-bot.
@@ -139,19 +141,20 @@ LLM возвращает `multi` со списком действий (разо�
 
 Полный список зависимостей для работы бота:
 
-| Компонент | Зачем | Как установить |
+**Режим API (по умолчанию)** — локальные модели не нужны вовсе:
+
+| Компонент | Зачем | Как получить |
 |---|---|---|
 | **Python 3.11+** | язык, на котором написан бот | `sudo apt install python3.11` / [python.org](https://www.python.org/downloads/) |
-| **ffmpeg** | Whisper читает через него голосовые (.ogg) | `sudo apt install ffmpeg` (macOS: `brew install ffmpeg`) |
-| **Ollama** | локальный сервер LLM | `curl -fsSL https://ollama.com/install.sh \| sh` |
-| **Модель qwen3.5:4b** | разбор естественного языка | `ollama pull qwen3.5:4b` (~2.5 ГБ) |
-| **Python-пакеты** | aiogram, aiosqlite, httpx, python-dotenv, openai-whisper (+PyTorch), tzdata | `pip install -r requirements.txt` |
-| **Модель Whisper medium** | распознавание речи | скачается автоматически при первом голосовом (~1.5 ГБ) |
+| **Ключ NVIDIA NIM** (`nvapi-…`) | LLM-разбор языка, бесплатные кредиты | [build.nvidia.com](https://build.nvidia.com) → любой профиль модели → Get API Key |
+| **Ключ Groq** (опционально) | облачное распознавание речи whisper-large-v3, бесплатный тариф | [console.groq.com](https://console.groq.com) → API Keys |
+| **Python-пакеты** | aiogram, aiosqlite, httpx, python-dotenv, tzdata | `pip install -r requirements.txt` |
 | **Токен Telegram-бота** | доступ к Telegram Bot API | получить у [@BotFather](https://t.me/BotFather), вписать в `.env` |
 
-Ориентировочные требования: ~5 ГБ диска под модели и от 8 ГБ ОЗУ
-(qwen3.5:4b и whisper-medium на CPU; с GPU всё заметно быстрее).
-На слабой машине поставьте в `.env` `WHISPER_MODEL=small` или `base`.
+**Локальный режим (опционально, фолбэк)** — если хочется без облака:
+Ollama (`LLM_API_BASE=http://localhost:11434/v1` + любая модель), локальный
+Whisper (`ASR_API_BASE` пустой; нужны `openai-whisper` из requirements,
+ffmpeg и ~2 ГБ под модель; на слабой машине `WHISPER_MODEL=small`).
 
 ## Установка по шагам
 
@@ -163,16 +166,22 @@ sudo apt install ffmpeg        # Debian/Ubuntu
 # brew install ffmpeg          # macOS
 ```
 
-### 2. Ollama и модель
+### 2. Ключи API
 
-```bash
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull qwen3.5:4b
-ollama serve   # если не запущена как сервис
-```
+- **LLM**: на [build.nvidia.com](https://build.nvidia.com) сгенерируйте ключ
+  `nvapi-…` и впишите его в `.env` (`LLM_API_KEY`). Модель по умолчанию —
+  `meta/llama-3.3-70b-instruct` (бесплатные кредиты); менять — `LLM_MODEL`.
+- **Голосовые** (опционально): бесплатный ключ на
+  [console.groq.com](https://console.groq.com), затем в `.env`:
+  `ASR_API_BASE=https://api.groq.com/openai/v1`, `ASR_API_KEY=gsk_…`.
+  Без этого используется локальный Whisper (нужен ffmpeg).
 
-Проверка: `curl http://localhost:11434/api/tags` должен вернуть JSON со
-списком моделей, в котором есть `qwen3.5:4b`.
+Проверка LLM: `curl -H "Authorization: Bearer $LLM_API_KEY"
+https://integrate.api.nvidia.com/v1/models` — вернёт список моделей.
+
+Локальная альтернатива (Ollama): `LLM_API_BASE=http://localhost:11434/v1`,
+`LLM_MODEL=qwen3.5:4b` — бот работает с ним через тот же OpenAI-совместимый
+клиент.
 
 ### 3. Python-окружение
 
@@ -264,8 +273,8 @@ python -m bot.main
 winget install Gyan.FFmpeg
 # после установки перезапустить терминал; проверка: ffmpeg -version
 
-# 3. Ollama — установщик с https://ollama.com/download/windows, затем:
-ollama pull qwen3.5:4b
+# 3. Ключи API: nvapi-… с build.nvidia.com (LLM) и, для голосовых,
+#    gsk_… с console.groq.com — вписать в .env
 
 # 4. Проект
 cd Telegram-calendar
@@ -296,9 +305,9 @@ python -m bot.main
 
 1. **Смотрите ответ бота на само сообщение** — теперь он есть всегда
    (статус → результат). «⚠️ Языковая модель недоступна» — не запущена
-   Ollama или не скачана модель.
-2. **Проверьте модель**: `ollama list` должен показывать `qwen3.5:4b`;
-   при старте бот пишет в лог, доступна ли Ollama и найдена ли модель.
+   LLM API (проверь LLM_API_BASE/LLM_API_KEY) или неверная модель.
+2. **Проверьте модель**: при старте бот пишет в лог, доступен ли LLM API
+   и найдена ли модель LLM_MODEL в списке /models.
 3. **Формат времени не проблема**: «16.30», «16-30», «7», «22» понимаются
    и приводятся к «16:30» / «07:00» и в коде, и в промпте модели.
 4. **Логи**: все ключевые события (действие LLM, обновление контекста,
@@ -311,7 +320,7 @@ python -m bot.main
 
 ## Обработка ошибок
 
-- **Ollama недоступна** — бот отвечает «модель недоступна», продолжает
+- **LLM API недоступен** — бот отвечает «сервис недоступен», продолжает
   работать (планировщик и команды не зависят от LLM).
 - **Невалидный JSON от LLM** — до 3 повторных запросов с описанием ошибок,
   затем вежливый отказ.

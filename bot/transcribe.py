@@ -1,14 +1,20 @@
-"""Транскрибация голосовых сообщений через Whisper (модель medium).
+"""Транскрибация голосовых сообщений.
 
-Модель загружается лениво при первом голосовом сообщении и держится в памяти.
-Распознавание — блокирующая CPU/GPU-операция, поэтому выполняется в отдельном
-потоке, чтобы не останавливать event loop бота.
+Два бэкенда:
+- облачный: любой OpenAI-совместимый /audio/transcriptions (например,
+  бесплатный Groq whisper-large-v3) — включается, если задан ASR_API_BASE;
+- локальный Whisper (фолбэк): модель загружается лениво при первом
+  голосовом и держится в памяти; распознавание — блокирующая операция,
+  выполняется в отдельном потоке и сериализовано (модель не потокобезопасна).
 """
 
 import asyncio
 import logging
+import os
 import shutil
 from typing import Optional
+
+import httpx
 
 log = logging.getLogger(__name__)
 
@@ -22,13 +28,28 @@ class TranscriptionError(Exception):
 
 
 class Transcriber:
-    def __init__(self, model_name: str = "medium"):
+    def __init__(
+        self,
+        model_name: str = "medium",
+        api_base: str = "",
+        api_key: str = "",
+        api_model: str = "whisper-large-v3",
+        language: str = "ru",
+    ):
         self.model_name = model_name
+        self.api_base = api_base.rstrip("/")
+        self.api_key = api_key
+        self.api_model = api_model
+        self.language = language
         self._model = None
         self._lock = asyncio.Lock()
         # Модель Whisper не потокобезопасна — распознавания выполняются
         # по одному (сообщения разных пользователей ждут очереди только здесь)
         self._infer_lock = asyncio.Lock()
+
+    @property
+    def remote(self) -> bool:
+        return bool(self.api_base)
 
     async def _get_model(self):
         async with self._lock:
@@ -45,6 +66,38 @@ class Transcriber:
         return self._model
 
     async def transcribe(self, path: str, language: Optional[str] = None) -> str:
+        if self.remote:
+            return await self._transcribe_remote(path, language or self.language)
+        return await self._transcribe_local(path, language)
+
+    async def _transcribe_remote(self, path: str, language: str) -> str:
+        """OpenAI-совместимый POST /audio/transcriptions (multipart)."""
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        data = {"model": self.api_model, "response_format": "json"}
+        if language:
+            data["language"] = language
+        try:
+            with open(path, "rb") as f:
+                files = {"file": (os.path.basename(path), f, "audio/ogg")}
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp = await client.post(
+                        f"{self.api_base}/audio/transcriptions",
+                        headers=headers, data=data, files=files,
+                    )
+            resp.raise_for_status()
+            text = str(resp.json().get("text", "")).strip()
+        except httpx.HTTPStatusError as e:
+            raise TranscriptionError(
+                f"ASR API вернул {e.response.status_code}: {e.response.text[:200]}",
+                public="ошибка сервиса",
+            ) from e
+        except (httpx.HTTPError, ValueError) as e:
+            raise TranscriptionError(f"ASR API недоступен: {e}", public="сервис недоступен") from e
+        if not text:
+            raise TranscriptionError("Речь не распознана (пустой результат)", public="пустое сообщение")
+        return text
+
+    async def _transcribe_local(self, path: str, language: Optional[str]) -> str:
         # Whisper читает аудио через ffmpeg; без него ошибка была бы невнятной
         if shutil.which("ffmpeg") is None:
             raise TranscriptionError(

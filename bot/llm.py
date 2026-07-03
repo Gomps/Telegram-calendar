@@ -1,7 +1,8 @@
-"""Клиент Ollama: запрос к qwen3.5:4b, валидация JSON-ответа и повторные попытки.
+"""Клиент LLM: любой OpenAI-совместимый API (NVIDIA NIM, Ollama /v1, OpenRouter…).
 
-При невалидном JSON (или JSON, не проходящем схему) модель получает свой
-ответ обратно вместе со списком ошибок и просьбу исправить — до N попыток.
+Валидация JSON-ответа и повторные попытки: при невалидном JSON (или JSON,
+не проходящем схему) модель получает свой ответ обратно вместе со списком
+ошибок и просьбу исправить — до N попыток.
 """
 
 import json
@@ -24,16 +25,24 @@ ACTIONS = {
 
 
 class LLMUnavailable(Exception):
-    """Ollama недоступна или вернула ошибку."""
+    """LLM API недоступен или вернул ошибку."""
 
 
 class LLMBadResponse(Exception):
     """Модель так и не вернула валидный JSON после всех попыток."""
 
 
+THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _strip_think(text: str) -> str:
+    """Убирает блоки размышлений (<think>…</think>) у reasoning-моделей."""
+    return THINK_RE.sub("", text).strip()
+
+
 def _extract_json(text: str) -> Optional[dict]:
     """Достаёт первый JSON-объект из текста (модель может добавить мусор вокруг)."""
-    text = text.strip()
+    text = _strip_think(text)
     try:
         obj = json.loads(text)
         return obj if isinstance(obj, dict) else None
@@ -278,12 +287,21 @@ def validate_blocks(data, source: str) -> tuple[list[dict], list[str]]:
     return out, errors
 
 
-class OllamaClient:
-    def __init__(self, base_url: str, model: str, retries: int = 3, timeout: float = 120.0):
-        self.base_url = base_url
+class LLMClient:
+    """OpenAI-совместимый chat-клиент (NVIDIA NIM, Ollama /v1, OpenRouter…)."""
+
+    def __init__(
+        self, base_url: str, model: str, api_key: str = "",
+        retries: int = 3, timeout: float = 120.0,
+    ):
+        self.base_url = base_url.rstrip("/")
         self.model = model
+        self.api_key = api_key
         self.retries = retries
         self.timeout = timeout
+
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
 
     async def parse_message(self, system_prompt: str, user_message: str) -> dict[str, Any]:
         """Возвращает провалидированный dict-действие. Бросает LLMUnavailable / LLMBadResponse."""
@@ -348,25 +366,38 @@ class OllamaClient:
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "format": "json",
-            "think": False,
-            "options": {"temperature": 0.1},
+            "temperature": 0.1,
+            "max_tokens": 2048,
         }
+        if "qwen3" in self.model.lower():
+            # у Qwen3/3.5 на NIM размышления уходят в reasoning_content и
+            # съедают лимит токенов — для наших структурных задач отключаем
+            payload["chat_template_kwargs"] = {"thinking": False}
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(f"{self.base_url}/api/chat", json=payload)
+                resp = await client.post(
+                    f"{self.base_url}/chat/completions", json=payload, headers=self._headers()
+                )
                 resp.raise_for_status()
-                return resp.json().get("message", {}).get("content", "")
-        except (httpx.HTTPError, json.JSONDecodeError) as e:
+                message = resp.json()["choices"][0]["message"]
+        except (httpx.HTTPError, json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
             raise LLMUnavailable(str(e)) from e
+        # content может отсутствовать (напр., лимит токенов в thinking) —
+        # пустая строка провалит валидацию и уйдёт в обычный ретрай
+        return message.get("content") or ""
 
     async def healthcheck(self) -> tuple[bool, bool]:
-        """(сервер доступен, модель скачана)."""
+        """(API доступен, модель существует)."""
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(f"{self.base_url}/api/tags")
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(f"{self.base_url}/models", headers=self._headers())
                 resp.raise_for_status()
-                models = {m.get("name", "") for m in resp.json().get("models", [])}
-        except (httpx.HTTPError, json.JSONDecodeError):
+                models = {m.get("id", "") for m in resp.json().get("data", [])}
+        except (httpx.HTTPError, json.JSONDecodeError, AttributeError):
             return False, False
-        return True, self.model in models or f"{self.model}:latest" in models
+        # некоторые шлюзы не отдают полный список — отсутствие в списке не фатально
+        return True, (not models) or self.model in models or f"{self.model}:latest" in models
+
+
+# Обратная совместимость со старым именем
+OllamaClient = LLMClient

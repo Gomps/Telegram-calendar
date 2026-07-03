@@ -21,7 +21,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from .config import Config
 from .db import Database
-from .llm import LLMBadResponse, LLMUnavailable, OllamaClient
+from .llm import LLMBadResponse, LLMUnavailable, LLMClient
 from .logbuffer import MemoryLogHandler, build_pages
 from .postprocess import (
     action_from_blocks,
@@ -532,7 +532,7 @@ async def on_voice(
     message: Message,
     bot: Bot,
     db: Database,
-    llm: OllamaClient,
+    llm: LLMClient,
     transcriber: Transcriber,
     cfg: Config,
 ) -> None:
@@ -567,7 +567,7 @@ async def on_voice(
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(
-    message: Message, bot: Bot, db: Database, llm: OllamaClient, cfg: Config
+    message: Message, bot: Bot, db: Database, llm: LLMClient, cfg: Config
 ) -> None:
     async with _user_locks[message.from_user.id]:
         status = StatusMessage(message)
@@ -586,7 +586,7 @@ async def on_other(message: Message) -> None:
 
 
 async def _corrective_retry(
-    llm: OllamaClient, system_prompt: str, hint: str, text: str
+    llm: LLMClient, system_prompt: str, hint: str, text: str
 ) -> dict | None:
     """Один повторный запрос к LLM с подсказкой; None — не получилось."""
     try:
@@ -635,7 +635,7 @@ async def process_text(
     message: Message,
     text: str,
     db: Database,
-    llm: OllamaClient,
+    llm: LLMClient,
     cfg: Config,
     bot: Bot,
     status: StatusMessage,
@@ -659,7 +659,7 @@ async def _process_text(
     message: Message,
     text: str,
     db: Database,
-    llm: OllamaClient,
+    llm: LLMClient,
     cfg: Config,
     bot: Bot,
     status: StatusMessage,
@@ -683,11 +683,11 @@ async def _process_text(
             blocks = await llm.split_message(build_split_prompt(), text)
             log.info("Пользователь %d: блоки %s", user_id, blocks)
         except LLMUnavailable as e:
-            log.error("Ollama недоступна: %s", e)
+            log.error("LLM API недоступен: %s", e)
             if _is_admin(user_id, cfg):
                 msg = (
-                    "⚠️ Ошибка обработки: языковая модель недоступна (Ollama не отвечает). "
-                    f"({e}) Проверь, что Ollama запущена и модель скачана."
+                    "⚠️ Ошибка обработки: языковая модель недоступна (LLM API не отвечает). "
+                    f"({e}) Проверь LLM_API_BASE, LLM_API_KEY и LLM_MODEL."
                 )
             else:
                 msg = "⚠️ Ошибка обработки: сервис временно недоступен. Повтори сообщение позже."
@@ -709,11 +709,11 @@ async def _process_text(
         try:
             action = await llm.parse_message(system_prompt, text)
         except LLMUnavailable as e:
-            log.error("Ollama недоступна: %s", e)
+            log.error("LLM API недоступен: %s", e)
             if _is_admin(user_id, cfg):
                 msg = (
-                    "⚠️ Ошибка обработки: языковая модель недоступна (Ollama не отвечает). "
-                    f"({e}) Проверь, что Ollama запущена и модель скачана."
+                    "⚠️ Ошибка обработки: языковая модель недоступна (LLM API не отвечает). "
+                    f"({e}) Проверь LLM_API_BASE, LLM_API_KEY и LLM_MODEL."
                 )
             else:
                 msg = "⚠️ Ошибка обработки: сервис временно недоступен. Повтори сообщение позже."

@@ -28,8 +28,16 @@ class Config:
     admin_ids: tuple[int, ...]
     # Статический белый список из .env (в дополнение к добавленным через /adduser)
     allowed_ids: tuple[int, ...]
-    ollama_url: str
-    ollama_model: str
+    # LLM: любой OpenAI-совместимый API (NVIDIA NIM, Ollama /v1, OpenRouter…)
+    llm_api_base: str
+    llm_api_key: str
+    llm_model: str
+    # Распознавание речи: OpenAI-совместимый /audio/transcriptions
+    # (например, Groq whisper-large-v3). Пустой asr_api_base = локальный Whisper.
+    asr_api_base: str
+    asr_api_key: str
+    asr_model: str
+    asr_language: str
     whisper_model: str
     default_tz: str
     db_path: str
@@ -52,12 +60,30 @@ def load_config() -> Config:
         raise RuntimeError(
             "BOT_TOKEN не задан. Скопируйте .env.example в .env и впишите токен бота."
         )
+    # Обратная совместимость: если заданы старые OLLAMA_URL/OLLAMA_MODEL,
+    # используем OpenAI-совместимый эндпоинт Ollama (/v1)
+    llm_api_base = os.getenv("LLM_API_BASE", "").strip().rstrip("/")
+    llm_model = os.getenv("LLM_MODEL", "").strip()
+    ollama_url = os.getenv("OLLAMA_URL", "").strip().rstrip("/")
+    if not llm_api_base:
+        if ollama_url:
+            llm_api_base = ollama_url + "/v1"
+        else:
+            llm_api_base = "https://integrate.api.nvidia.com/v1"
+    if not llm_model:
+        llm_model = os.getenv("OLLAMA_MODEL", "").strip() or "qwen/qwen3.5-122b-a10b"
+
     return Config(
         bot_token=token,
         admin_ids=_parse_ids(os.getenv("ADMIN_USER_IDS", "")),
         allowed_ids=_parse_ids(os.getenv("ALLOWED_USER_IDS", "")),
-        ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/"),
-        ollama_model=os.getenv("OLLAMA_MODEL", "qwen3.5:4b"),
+        llm_api_base=llm_api_base,
+        llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
+        llm_model=llm_model,
+        asr_api_base=os.getenv("ASR_API_BASE", "").strip().rstrip("/"),
+        asr_api_key=os.getenv("ASR_API_KEY", "").strip(),
+        asr_model=os.getenv("ASR_MODEL", "whisper-large-v3").strip(),
+        asr_language=os.getenv("ASR_LANGUAGE", "ru").strip(),
         whisper_model=os.getenv("WHISPER_MODEL", "medium"),
         default_tz=os.getenv("DEFAULT_TZ", "Europe/Minsk"),
         db_path=os.getenv("DB_PATH", "data/bot.db"),

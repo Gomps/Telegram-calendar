@@ -13,7 +13,7 @@ from .access import AccessMiddleware
 from .config import load_config
 from .db import Database
 from .handlers import router
-from .llm import OllamaClient
+from .llm import LLMClient
 from .logbuffer import MemoryLogHandler
 from .scheduler import ReminderScheduler
 from .transcribe import Transcriber
@@ -59,29 +59,36 @@ async def main() -> None:
     await db.connect()
     log.info("БД подключена: %s", cfg.db_path)
 
-    if shutil.which("ffmpeg") is None:
+    if not cfg.asr_api_base and shutil.which("ffmpeg") is None:
         log.warning(
-            "ffmpeg не найден в PATH — голосовые сообщения не будут распознаваться "
-            "(Windows: winget install Gyan.FFmpeg; Linux: sudo apt install ffmpeg)"
+            "ffmpeg не найден в PATH — локальное распознавание голосовых не будет "
+            "работать (Windows: winget install Gyan.FFmpeg; Linux: sudo apt install ffmpeg). "
+            "Либо настрой облачное: ASR_API_BASE в .env."
         )
+    if cfg.asr_api_base:
+        log.info("Распознавание речи: облачное API %s (модель %s, язык %s)",
+                 cfg.asr_api_base, cfg.asr_model, cfg.asr_language)
+    else:
+        log.info("Распознавание речи: локальный Whisper «%s»", cfg.whisper_model)
 
-    llm = OllamaClient(
-        cfg.ollama_url, cfg.ollama_model, retries=cfg.llm_retries, timeout=cfg.llm_timeout
+    llm = LLMClient(
+        cfg.llm_api_base, cfg.llm_model, api_key=cfg.llm_api_key,
+        retries=cfg.llm_retries, timeout=cfg.llm_timeout,
     )
     server_ok, model_ok = await llm.healthcheck()
     if not server_ok:
         log.warning(
-            "Ollama недоступна на %s — бот запустится, но разбор сообщений не будет "
-            "работать, пока Ollama не поднимется.",
-            cfg.ollama_url,
+            "LLM API недоступен на %s — бот запустится, но разбор сообщений не будет "
+            "работать (проверь LLM_API_BASE и LLM_API_KEY).",
+            cfg.llm_api_base,
         )
     elif not model_ok:
         log.warning(
-            "Ollama работает, но модель «%s» не найдена. Выполните: ollama pull %s",
-            cfg.ollama_model, cfg.ollama_model,
+            "LLM API работает, но модель «%s» не найдена в списке — проверь LLM_MODEL.",
+            cfg.llm_model,
         )
     else:
-        log.info("Ollama доступна: %s (модель %s)", cfg.ollama_url, cfg.ollama_model)
+        log.info("LLM API доступен: %s (модель %s)", cfg.llm_api_base, cfg.llm_model)
 
     bot = Bot(token=cfg.bot_token)
     dp = Dispatcher()
@@ -89,7 +96,13 @@ async def main() -> None:
     # Внедрение зависимостей в обработчики по имени параметра
     dp["db"] = db
     dp["llm"] = llm
-    dp["transcriber"] = Transcriber(cfg.whisper_model)
+    dp["transcriber"] = Transcriber(
+        cfg.whisper_model,
+        api_base=cfg.asr_api_base,
+        api_key=cfg.asr_api_key,
+        api_model=cfg.asr_model,
+        language=cfg.asr_language,
+    )
     dp["cfg"] = cfg
     dp["logbuffer"] = logbuffer
 
