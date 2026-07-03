@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 import httpx
 
+from .postprocess import is_verbatim_fragment
 from .rules import normalize_hhmm, parse_hhmm, validate_rule
 
 log = logging.getLogger(__name__)
@@ -245,6 +246,38 @@ def _validate_conditional_value(key: str, variants: list) -> list[str]:
     return errors
 
 
+SPLIT_TYPES = {"task", "time", "repeat", "condition", "fact", "location_time", "other"}
+
+
+def validate_blocks(data, source: str) -> tuple[list[dict], list[str]]:
+    """Проверка разметки: типы из списка, каждый text — ДОСЛОВНЫЙ кусок сообщения."""
+    if not isinstance(data, dict):
+        return [], ["ответ не является JSON-объектом"]
+    blocks = data.get("blocks")
+    if not isinstance(blocks, list) or not blocks:
+        return [], ["нужен непустой список blocks"]
+    out: list[dict] = []
+    errors: list[str] = []
+    for i, b in enumerate(blocks):
+        if not isinstance(b, dict):
+            errors.append(f"blocks[{i}] должен быть объектом")
+            continue
+        btype = b.get("type")
+        btext = str(b.get("text") or "").strip()
+        if btype not in SPLIT_TYPES:
+            errors.append(f"blocks[{i}].type «{btype}» не из списка {sorted(SPLIT_TYPES)}")
+        elif not btext:
+            errors.append(f"blocks[{i}].text пуст")
+        elif not is_verbatim_fragment(btext, source):
+            errors.append(
+                f"blocks[{i}].text «{btext}» не является дословным фрагментом сообщения — "
+                "скопируй кусок сообщения без изменений, перефразировать нельзя"
+            )
+        else:
+            out.append({"type": btype, "text": btext})
+    return out, errors
+
+
 class OllamaClient:
     def __init__(self, base_url: str, model: str, retries: int = 3, timeout: float = 120.0):
         self.base_url = base_url
@@ -279,6 +312,34 @@ class OllamaClient:
                 "content": "Твой ответ не прошёл валидацию: "
                 + "; ".join(errors)
                 + ". Верни исправленный JSON-объект по схеме, без каких-либо пояснений.",
+            })
+        raise LLMBadResponse("; ".join(last_errors))
+
+    async def split_message(self, system_prompt: str, text: str) -> list[dict]:
+        """Разбиение сообщения на дословные блоки. Бросает LLMUnavailable/LLMBadResponse."""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ]
+        last_errors: list[str] = []
+        for attempt in range(1, self.retries + 1):
+            raw = await self._chat(messages)
+            data = _extract_json(raw)
+            blocks, errors = ([], ["ответ не является JSON-объектом"]) if data is None \
+                else validate_blocks(data, text)
+            if not errors:
+                return blocks
+            last_errors = errors
+            log.warning(
+                "Невалидная разметка (попытка %d/%d): %s; ответ: %.300r",
+                attempt, self.retries, errors, raw,
+            )
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({
+                "role": "user",
+                "content": "Разметка не прошла проверку: "
+                + "; ".join(errors)
+                + ". Верни исправленный JSON {\"blocks\": [...]} без пояснений.",
             })
         raise LLMBadResponse("; ".join(last_errors))
 

@@ -24,12 +24,13 @@ from .db import Database
 from .llm import LLMBadResponse, LLMUnavailable, OllamaClient
 from .logbuffer import MemoryLogHandler, build_pages
 from .postprocess import (
+    action_from_blocks,
     enforce_weekday,
     is_periodic_text,
     sanitize_action,
     text_matches_source,
 )
-from .prompts import build_system_prompt
+from .prompts import build_split_prompt, build_system_prompt
 from .rules import (
     DOW_SHORT,
     describe_rule,
@@ -671,29 +672,61 @@ async def _process_text(
     now_local = datetime.now(timezone.utc).astimezone(tz)
     pending = await db.get_pending_clarification(user_id)
 
-    await status.set(prefix + "⏳ Этап 2/3: разбираю запрос (LLM)…")
-    system_prompt = build_system_prompt(now_local, user["timezone"], user["context"], pending)
-    try:
-        action = await llm.parse_message(system_prompt, text)
-    except LLMUnavailable as e:
-        log.error("Ollama недоступна: %s", e)
-        if _is_admin(user_id, cfg):
-            msg = (
-                "⚠️ Ошибка обработки: языковая модель недоступна (Ollama не отвечает). "
-                f"({e}) Проверь, что Ollama запущена и модель скачана."
+    # Этап 1: LLM размечает сообщение на ДОСЛОВНЫЕ блоки (task/time/repeat/…),
+    # дословность проверяется кодом. Этап 2: простые случаи собираются в
+    # действие детерминированно, без второго вызова LLM.
+    blocks = None
+    action = None
+    if pending is None:
+        await status.set(prefix + "⏳ Этап 2/3: разбираю на составляющие…")
+        try:
+            blocks = await llm.split_message(build_split_prompt(), text)
+            log.info("Пользователь %d: блоки %s", user_id, blocks)
+        except LLMUnavailable as e:
+            log.error("Ollama недоступна: %s", e)
+            if _is_admin(user_id, cfg):
+                msg = (
+                    "⚠️ Ошибка обработки: языковая модель недоступна (Ollama не отвечает). "
+                    f"({e}) Проверь, что Ollama запущена и модель скачана."
+                )
+            else:
+                msg = "⚠️ Ошибка обработки: сервис временно недоступен. Повтори сообщение позже."
+            await status.finish(prefix + msg)
+            return
+        except LLMBadResponse as e:
+            log.warning("Разметка на блоки не удалась (%s) — одновызовный путь", e)
+    if blocks:
+        assembled = action_from_blocks(blocks, text, now_local)
+        if assembled is not None:
+            log.info("Пользователь %d: действие собрано из блоков без второго вызова LLM", user_id)
+            action = assembled
+
+    system_prompt = build_system_prompt(
+        now_local, user["timezone"], user["context"], pending, blocks=blocks
+    )
+    if action is None:
+        await status.set(prefix + "⏳ Этап 2/3: разбираю запрос (LLM)…")
+        try:
+            action = await llm.parse_message(system_prompt, text)
+        except LLMUnavailable as e:
+            log.error("Ollama недоступна: %s", e)
+            if _is_admin(user_id, cfg):
+                msg = (
+                    "⚠️ Ошибка обработки: языковая модель недоступна (Ollama не отвечает). "
+                    f"({e}) Проверь, что Ollama запущена и модель скачана."
+                )
+            else:
+                msg = "⚠️ Ошибка обработки: сервис временно недоступен. Повтори сообщение позже."
+            await status.finish(prefix + msg)
+            return
+        except LLMBadResponse as e:
+            log.error("LLM не вернула валидный JSON: %s", e)
+            detail = f"\n({e})" if _is_admin(user_id, cfg) else ""
+            await status.finish(
+                prefix + "😕 Не смог разобрать запрос. Попробуй сформулировать иначе — "
+                f"например, укажи время с двоеточием: «в 16:30».{detail}"
             )
-        else:
-            msg = "⚠️ Ошибка обработки: сервис временно недоступен. Повтори сообщение позже."
-        await status.finish(prefix + msg)
-        return
-    except LLMBadResponse as e:
-        log.error("LLM не вернула валидный JSON: %s", e)
-        detail = f"\n({e})" if _is_admin(user_id, cfg) else ""
-        await status.finish(
-            prefix + "😕 Не смог разобрать запрос. Попробуй сформулировать иначе — "
-            f"например, укажи время с двоеточием: «в 16:30».{detail}"
-        )
-        return
+            return
 
     log.info("Пользователь %d: action=%s", user_id, action.get("action"))
     # Жёсткая детерминированная правка черновика LLM по исходному тексту:

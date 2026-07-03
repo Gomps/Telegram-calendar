@@ -19,6 +19,7 @@ from .timeparse import (
     extract_parity,
     extract_weekdays,
     parse_time_expression,
+    strip_time_phrases,
 )
 
 log = logging.getLogger(__name__)
@@ -33,10 +34,30 @@ PERIODIC_RE = re.compile(
 # Служебные слова, не влияющие на смысл напоминания
 FILLER_WORDS = {
     "напомни", "напоминай", "напомнить", "напоминание", "напоминания",
-    "пожалуйста", "поставь", "создай", "сделай", "чтобы", "нужно", "надо",
-    "мне", "меня", "потом", "если", "когда", "завтра", "сегодня", "через",
+    "пожалуйста", "поставь", "создай", "чтобы", "нужно", "надо",
+    "мне", "меня", "нам", "нас", "тебе", "потом", "если", "когда",
+    "завтра", "сегодня", "через",
     "каждый", "каждую", "каждое", "каждые", "минут", "минуты", "часов", "часа",
 }
+
+
+def normalize_for_match(text: str) -> str:
+    """Нормализация для проверки дословности: регистр, ё, пунктуация -> пробелы."""
+    s = str(text).lower().replace("ё", "е")
+    s = re.sub(r"[^0-9a-zа-я]+", " ", s)
+    return " ".join(s.split())
+
+
+def is_verbatim_fragment(fragment: str, source: str) -> bool:
+    """Является ли fragment дословным куском source (с точностью до регистра/пунктуации)."""
+    f, s = normalize_for_match(fragment), normalize_for_match(source)
+    return bool(f) and f" {f} " in f" {s} "
+
+
+def task_from_text(text: str) -> str:
+    """«Суть» сообщения: без временных фрагментов и служебных слов."""
+    words = [w for w in strip_time_phrases(text).split() if w not in FILLER_WORDS]
+    return " ".join(words)
 
 
 def stems(text: str) -> set[str]:
@@ -54,6 +75,68 @@ def text_matches_source(candidate: str, source: str, threshold: float = 0.5) -> 
 
 def is_periodic_text(text: str) -> bool:
     return PERIODIC_RE.search(str(text).lower().replace("ё", "е")) is not None
+
+
+def action_from_blocks(blocks: list[dict], text: str, now_local: datetime) -> Optional[dict]:
+    """Детерминированная сборка действия из дословных блоков LLM-разметки.
+
+    Собираем только однозначные случаи (задача + время; задача + простое
+    повторение). Условия, факты о распорядке, интервальные серии и
+    непарсящееся время -> None, ими займётся основной конвейер.
+    """
+    by: dict[str, list[str]] = {}
+    for b in blocks:
+        t = str(b.get("text") or "").strip()
+        if t:
+            by.setdefault(str(b.get("type")), []).append(t)
+
+    if by.get("condition") or by.get("fact") or by.get("location_time"):
+        return None
+    tasks = by.get("task") or []
+    if not tasks:
+        return None
+    task_text = ", ".join(tasks)
+    task_text = task_text[:1].upper() + task_text[1:]
+
+    times = by.get("time") or []
+    time_str = " ".join(times)
+    periodic = bool(by.get("repeat")) or is_periodic_text(text)
+
+    if not periodic:
+        if not times:
+            return None
+        fire = parse_time_expression(time_str, now_local) or parse_time_expression(text, now_local)
+        if fire is None:
+            return None
+        log.info("Сборка из блоков: разовое «%s» на %s", task_text, fire)
+        return {
+            "action": "create_reminder",
+            "reminder_text": task_text,
+            "time_expression": time_str,
+            "fire_at": fire.strftime("%Y-%m-%dT%H:%M"),
+        }
+
+    # периодическое: собираем только weekly/daily с конкретным временем
+    if extract_interval_minutes(text) is not None:
+        return None  # интервальной серии нужны якоря — пусть строит основной конвейер
+    fire = None
+    if time_str:
+        fire = parse_time_expression(time_str, now_local)
+    if fire is None:
+        fire = parse_time_expression(text, now_local)
+    if fire is None:
+        return None
+    weekdays = extract_weekdays(text)
+    rule: dict = {
+        "type": "weekly" if weekdays else "daily",
+        "days_of_week": weekdays or None,
+        "time": fire.strftime("%H:%M"),
+    }
+    parity = extract_parity(text)
+    if parity:
+        rule["day_parity"] = parity
+    log.info("Сборка из блоков: серия «%s» %s", task_text, rule)
+    return {"action": "create_recurring", "reminder_text": task_text, "recurring": rule}
 
 
 def sanitize_action(action: dict, text: str, now_local: datetime) -> dict:
@@ -76,8 +159,45 @@ def sanitize_action(action: dict, text: str, now_local: datetime) -> dict:
     if kind == "create_recurring":
         _fix_rule_from_text(action.get("recurring"), text)
     elif kind == "ask_clarification":
+        converted = _answer_clarification_from_text(action, text, now_local)
+        if converted is not None:
+            return converted
         _fix_clarification(action, text)
     return action
+
+
+# Уточнения про эти ключи распорядка легитимны — их из текста не вычислить
+CONTEXT_CLARIFY_KEYS = {
+    "work_start", "work_end", "sleep_start", "sleep_end",
+    "lunch_start", "lunch_end",
+}
+
+
+def _answer_clarification_from_text(
+    action: dict, text: str, now_local: datetime
+) -> Optional[dict]:
+    """Не спрашиваем «когда напомнить», если время написано в самом сообщении."""
+    if is_periodic_text(text):
+        return None
+    missing = {str(m) for m in (action.get("missing_fields") or [])}
+    if missing & CONTEXT_CLARIFY_KEYS:
+        return None
+    fire = parse_time_expression(text, now_local)
+    if fire is None:
+        return None
+    task = str(action.get("reminder_text") or "").strip()
+    if not task or not text_matches_source(task, text):
+        task = task_from_text(text)
+    if not task:
+        return None
+    log.info("Санитайзер: время есть в сообщении — вместо вопроса создаю напоминание на %s", fire)
+    return {
+        "action": "create_reminder",
+        "reminder_text": task[:1].upper() + task[1:],
+        "time_expression": text,
+        "fire_at": fire.strftime("%Y-%m-%dT%H:%M"),
+        **({"context_updates": action["context_updates"]} if action.get("context_updates") else {}),
+    }
 
 
 def _demote_to_reminder(action: dict, text: str, now_local: datetime) -> dict:
@@ -183,7 +303,9 @@ def _fix_clarification(action: dict, text: str) -> None:
         return
     subject = str(action.get("reminder_text") or "").strip()
     if not subject or not text_matches_source(subject, text):
-        subject = " ".join(text.split()[:8])
+        # суть сообщения без временных фрагментов и служебных слов,
+        # а не «первые N слов» (туда попадало время и мусор)
+        subject = task_from_text(text) or " ".join(text.split()[:8])
     new_q = f"Когда напомнить «{subject}»? Укажи дату и время — например «во вторник в 12:00»."
     log.info("Санитайзер: вопрос «%s» не про сообщение пользователя — заменён", question)
     action["clarification_question"] = new_q
