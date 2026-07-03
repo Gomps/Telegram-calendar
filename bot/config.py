@@ -32,6 +32,17 @@ class Config:
     llm_api_base: str
     llm_api_key: str
     llm_model: str
+    # Цепочка моделей основного провайдера: недоступна одна — берём следующую
+    llm_models: tuple[str, ...]
+    # Запасной провайдер (например, локальная Ollama), пробуется после основного
+    llm_fallback_api_base: str
+    llm_fallback_api_key: str
+    llm_fallback_models: tuple[str, ...]
+    # Сколько попыток на каждую модель при недоступности
+    llm_attempts_per_model: int
+    # Предварительное LLM-разбиение сообщения на блоки (0 = LLM решает всё сама
+    # одним вызовом, бот проверяет форму; 1 = включить этап разбиения)
+    split_stage: bool
     # Распознавание речи: OpenAI-совместимый /audio/transcriptions
     # (например, Groq whisper-large-v3). Пустой asr_api_base = локальный Whisper.
     asr_api_base: str
@@ -73,13 +84,30 @@ def load_config() -> Config:
     if not llm_model:
         llm_model = os.getenv("OLLAMA_MODEL", "").strip() or "qwen/qwen3.5-122b-a10b"
 
+    models_raw = os.getenv(
+        "LLM_MODELS",
+        "qwen/qwen3.5-122b-a10b,meta/llama-3.3-70b-instruct,qwen/qwen3-next-80b-a3b-instruct",
+    )
+    llm_models = tuple(m.strip() for m in models_raw.split(",") if m.strip())
+    if llm_model not in llm_models:
+        llm_models = (llm_model,) + llm_models
+
+    fb_models_raw = os.getenv("LLM_FALLBACK_MODELS", "")
+    llm_fallback_models = tuple(m.strip() for m in fb_models_raw.split(",") if m.strip())
+
     return Config(
         bot_token=token,
         admin_ids=_parse_ids(os.getenv("ADMIN_USER_IDS", "")),
         allowed_ids=_parse_ids(os.getenv("ALLOWED_USER_IDS", "")),
         llm_api_base=llm_api_base,
         llm_api_key=os.getenv("LLM_API_KEY", "").strip(),
-        llm_model=llm_model,
+        llm_model=llm_models[0],
+        llm_models=llm_models,
+        llm_fallback_api_base=os.getenv("LLM_FALLBACK_API_BASE", "").strip().rstrip("/"),
+        llm_fallback_api_key=os.getenv("LLM_FALLBACK_API_KEY", "").strip(),
+        llm_fallback_models=llm_fallback_models,
+        llm_attempts_per_model=int(os.getenv("LLM_ATTEMPTS_PER_MODEL", "3")),
+        split_stage=os.getenv("SPLIT_STAGE", "0").strip() in ("1", "true", "yes"),
         asr_api_base=os.getenv("ASR_API_BASE", "").strip().rstrip("/"),
         asr_api_key=os.getenv("ASR_API_KEY", "").strip(),
         asr_model=os.getenv("ASR_MODEL", "whisper-large-v3").strip(),

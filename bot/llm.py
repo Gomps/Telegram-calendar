@@ -5,9 +5,11 @@
 ошибок и просьбу исправить — до N попыток.
 """
 
+import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
@@ -287,21 +289,60 @@ def validate_blocks(data, source: str) -> tuple[list[dict], list[str]]:
     return out, errors
 
 
+@dataclass(frozen=True)
+class LLMProvider:
+    base_url: str
+    api_key: str
+    model: str
+
+    def label(self) -> str:
+        host = self.base_url.split("//")[-1].split("/")[0]
+        return f"{self.model}@{host}"
+
+
 class LLMClient:
-    """OpenAI-совместимый chat-клиент (NVIDIA NIM, Ollama /v1, OpenRouter…)."""
+    """OpenAI-совместимый chat-клиент (NVIDIA NIM, Ollama /v1, OpenRouter…).
+
+    Поддерживает цепочку провайдеров/моделей: недоступна одна — до
+    attempts_per_model попыток, затем следующая, пока цепочка не кончится.
+    Последний работавший провайдер запоминается и пробуется первым.
+    """
 
     def __init__(
-        self, base_url: str, model: str, api_key: str = "",
+        self, base_url: str = "", model: str = "", api_key: str = "",
         retries: int = 3, timeout: float = 120.0,
+        providers: Optional[list[LLMProvider]] = None,
+        attempts_per_model: int = 3,
     ):
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.api_key = api_key
+        if providers is None:
+            providers = [LLMProvider(base_url, api_key, model)]
+        self.providers = [
+            LLMProvider(p.base_url.rstrip("/"), p.api_key, p.model) for p in providers
+        ]
         self.retries = retries
         self.timeout = timeout
+        self.attempts_per_model = max(1, attempts_per_model)
+        self._active = 0  # индекс последнего работавшего провайдера
 
-    def _headers(self) -> dict:
-        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+    # совместимость со старым однопровайдерным интерфейсом
+    @property
+    def base_url(self) -> str:
+        return self.providers[0].base_url
+
+    @property
+    def model(self) -> str:
+        return self.providers[0].model
+
+    @property
+    def api_key(self) -> str:
+        return self.providers[0].api_key
+
+    def _headers(self, provider: Optional[LLMProvider] = None) -> dict:
+        key = (provider or self.providers[0]).api_key
+        return {"Authorization": f"Bearer {key}"} if key else {}
+
+    def describe(self) -> str:
+        return " -> ".join(p.label() for p in self.providers)
 
     async def parse_message(self, system_prompt: str, user_message: str) -> dict[str, Any]:
         """Возвращает провалидированный dict-действие. Бросает LLMUnavailable / LLMBadResponse."""
@@ -362,24 +403,57 @@ class LLMClient:
         raise LLMBadResponse("; ".join(last_errors))
 
     async def _chat(self, messages: list[dict]) -> str:
+        """Перебор цепочки провайдеров: по attempts_per_model попыток на каждого."""
+        errors: list[str] = []
+        n = len(self.providers)
+        for shift in range(n):
+            idx = (self._active + shift) % n
+            provider = self.providers[idx]
+            for attempt in range(1, self.attempts_per_model + 1):
+                try:
+                    content = await self._chat_once(provider, messages)
+                    self._active = idx
+                    return content
+                except _PermanentProviderError as e:
+                    # 401/403/404 — повторять на этом провайдере бессмысленно
+                    errors.append(f"{provider.label()}: {e}")
+                    log.warning("LLM %s: постоянная ошибка (%s) — следующая модель",
+                                provider.label(), e)
+                    break
+                except LLMUnavailable as e:
+                    errors.append(f"{provider.label()}#{attempt}: {e}")
+                    log.warning("LLM %s недоступна (попытка %d/%d): %s",
+                                provider.label(), attempt, self.attempts_per_model, e)
+                    if attempt < self.attempts_per_model:
+                        await asyncio.sleep(min(2 ** (attempt - 1), 4))
+        raise LLMUnavailable("все модели недоступны: " + " | ".join(errors[-4:]))
+
+    async def _chat_once(self, provider: LLMProvider, messages: list[dict]) -> str:
         payload = {
-            "model": self.model,
+            "model": provider.model,
             "messages": messages,
             "stream": False,
             "temperature": 0.1,
             "max_tokens": 2048,
         }
-        if "qwen3" in self.model.lower():
+        if "qwen3" in provider.model.lower():
             # у Qwen3/3.5 на NIM размышления уходят в reasoning_content и
             # съедают лимит токенов — для наших структурных задач отключаем
             payload["chat_template_kwargs"] = {"thinking": False}
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 resp = await client.post(
-                    f"{self.base_url}/chat/completions", json=payload, headers=self._headers()
+                    f"{provider.base_url}/chat/completions",
+                    json=payload, headers=self._headers(provider),
                 )
                 resp.raise_for_status()
                 message = resp.json()["choices"][0]["message"]
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            detail = f"HTTP {status}: {e.response.text[:200]}"
+            if status in (400, 401, 403, 404):
+                raise _PermanentProviderError(detail) from e
+            raise LLMUnavailable(detail) from e
         except (httpx.HTTPError, json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
             raise LLMUnavailable(str(e)) from e
         # content может отсутствовать (напр., лимит токенов в thinking) —
@@ -387,16 +461,25 @@ class LLMClient:
         return message.get("content") or ""
 
     async def healthcheck(self) -> tuple[bool, bool]:
-        """(API доступен, модель существует)."""
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(f"{self.base_url}/models", headers=self._headers())
-                resp.raise_for_status()
-                models = {m.get("id", "") for m in resp.json().get("data", [])}
-        except (httpx.HTTPError, json.JSONDecodeError, AttributeError):
-            return False, False
-        # некоторые шлюзы не отдают полный список — отсутствие в списке не фатально
-        return True, (not models) or self.model in models or f"{self.model}:latest" in models
+        """(хоть один провайдер доступен, модель существует у него)."""
+        for provider in self.providers:
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.get(
+                        f"{provider.base_url}/models", headers=self._headers(provider)
+                    )
+                    resp.raise_for_status()
+                    models = {m.get("id", "") for m in resp.json().get("data", [])}
+            except (httpx.HTTPError, json.JSONDecodeError, AttributeError):
+                continue
+            # некоторые шлюзы не отдают полный список — отсутствие в нём не фатально
+            return True, (not models) or provider.model in models \
+                or f"{provider.model}:latest" in models
+        return False, False
+
+
+class _PermanentProviderError(LLMUnavailable):
+    """Ошибка провайдера, при которой повторные попытки бессмысленны."""
 
 
 # Обратная совместимость со старым именем

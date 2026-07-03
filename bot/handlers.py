@@ -672,12 +672,12 @@ async def _process_text(
     now_local = datetime.now(timezone.utc).astimezone(tz)
     pending = await db.get_pending_clarification(user_id)
 
-    # Этап 1: LLM размечает сообщение на ДОСЛОВНЫЕ блоки (task/time/repeat/…),
-    # дословность проверяется кодом. Этап 2: простые случаи собираются в
-    # действие детерминированно, без второго вызова LLM.
+    # Опциональный этап (SPLIT_STAGE=1): LLM размечает сообщение на ДОСЛОВНЫЕ
+    # блоки, простые случаи собираются кодом. По умолчанию выключен — LLM
+    # решает всё одним вызовом, бот проверяет форму и факты (санитайзер).
     blocks = None
     action = None
-    if pending is None:
+    if cfg.split_stage and pending is None:
         await status.set(prefix + "⏳ Этап 2/3: разбираю на составляющие…")
         try:
             blocks = await llm.split_message(build_split_prompt(), text)

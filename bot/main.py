@@ -13,7 +13,7 @@ from .access import AccessMiddleware
 from .config import load_config
 from .db import Database
 from .handlers import router
-from .llm import LLMClient
+from .llm import LLMClient, LLMProvider
 from .logbuffer import MemoryLogHandler
 from .scheduler import ReminderScheduler
 from .transcribe import Transcriber
@@ -71,24 +71,32 @@ async def main() -> None:
     else:
         log.info("Распознавание речи: локальный Whisper «%s»", cfg.whisper_model)
 
+    providers = [
+        LLMProvider(cfg.llm_api_base, cfg.llm_api_key, m) for m in cfg.llm_models
+    ]
+    if cfg.llm_fallback_api_base and cfg.llm_fallback_models:
+        providers += [
+            LLMProvider(cfg.llm_fallback_api_base, cfg.llm_fallback_api_key, m)
+            for m in cfg.llm_fallback_models
+        ]
     llm = LLMClient(
-        cfg.llm_api_base, cfg.llm_model, api_key=cfg.llm_api_key,
-        retries=cfg.llm_retries, timeout=cfg.llm_timeout,
+        providers=providers, retries=cfg.llm_retries, timeout=cfg.llm_timeout,
+        attempts_per_model=cfg.llm_attempts_per_model,
     )
+    log.info("Цепочка LLM (по %d попытки на модель): %s",
+             cfg.llm_attempts_per_model, llm.describe())
     server_ok, model_ok = await llm.healthcheck()
     if not server_ok:
         log.warning(
-            "LLM API недоступен на %s — бот запустится, но разбор сообщений не будет "
-            "работать (проверь LLM_API_BASE и LLM_API_KEY).",
-            cfg.llm_api_base,
+            "Ни один LLM-провайдер не отвечает — бот запустится, но разбор сообщений "
+            "не будет работать. Проверь LLM_API_BASE/LLM_API_KEY; если ты в регионе, "
+            "где NVIDIA API заблокирован (например, Беларусь/Россия), нужен "
+            "VPN/прокси или запасной провайдер (LLM_FALLBACK_API_BASE)."
         )
     elif not model_ok:
-        log.warning(
-            "LLM API работает, но модель «%s» не найдена в списке — проверь LLM_MODEL.",
-            cfg.llm_model,
-        )
+        log.warning("LLM API отвечает, но модель не найдена в списке — проверь LLM_MODELS.")
     else:
-        log.info("LLM API доступен: %s (модель %s)", cfg.llm_api_base, cfg.llm_model)
+        log.info("LLM API доступен")
 
     bot = Bot(token=cfg.bot_token)
     dp = Dispatcher()

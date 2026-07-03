@@ -179,6 +179,15 @@ sudo apt install ffmpeg        # Debian/Ubuntu
 Проверка LLM: `curl -H "Authorization: Bearer $LLM_API_KEY"
 https://integrate.api.nvidia.com/v1/models` — вернёт список моделей.
 
+> **Гео-блокировка**: NVIDIA API недоступен из некоторых стран (Беларусь,
+> Россия) — «All connection attempts failed». Решения: VPN/прокси на машине
+> бота, либо запасной провайдер в `.env` (`LLM_FALLBACK_API_BASE` — например,
+> локальная Ollama), либо другой OpenAI-совместимый сервис в `LLM_API_BASE`.
+
+**Отказоустойчивость**: `LLM_MODELS` — цепочка моделей; каждая пробуется
+до `LLM_ATTEMPTS_PER_MODEL` раз (с паузами), затем следующая, затем модели
+запасного провайдера. Последняя работавшая запоминается и пробуется первой.
+
 Локальная альтернатива (Ollama): `LLM_API_BASE=http://localhost:11434/v1`,
 `LLM_MODEL=qwen3.5:4b` — бот работает с ним через тот же OpenAI-совместимый
 клиент.
