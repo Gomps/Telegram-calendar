@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import importlib.util
 import logging
 import os
 import shutil
@@ -20,11 +21,17 @@ log = logging.getLogger(__name__)
 
 
 class TranscriptionError(Exception):
-    """detail — для логов/админа; public — короткая категория для пользователя."""
+    """detail — для логов/админа; public — короткая категория для пользователя.
 
-    def __init__(self, detail: str, public: str = "ошибка сервиса"):
+    network=True помечает сетевые сбои облачного ASR (не достучались до
+    хоста — не путать с ответом сервиса вроде 401/400), при которых имеет
+    смысл откатиться на локальный Whisper, если он настроен.
+    """
+
+    def __init__(self, detail: str, public: str = "ошибка сервиса", network: bool = False):
         super().__init__(detail)
         self.public = public
+        self.network = network
 
 
 class Transcriber:
@@ -35,12 +42,14 @@ class Transcriber:
         api_key: str = "",
         api_model: str = "whisper-large-v3",
         language: str = "ru",
+        connect_timeout: float = 10.0,
     ):
         self.model_name = model_name
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.api_model = api_model
         self.language = language
+        self.connect_timeout = connect_timeout
         self._model = None
         self._lock = asyncio.Lock()
         # Модель Whisper не потокобезопасна — распознавания выполняются
@@ -50,6 +59,11 @@ class Transcriber:
     @property
     def remote(self) -> bool:
         return bool(self.api_base)
+
+    @staticmethod
+    def local_available() -> bool:
+        """Можно ли откатиться на локальный Whisper: есть ffmpeg и пакет установлен."""
+        return shutil.which("ffmpeg") is not None and importlib.util.find_spec("whisper") is not None
 
     async def _get_model(self):
         async with self._lock:
@@ -66,9 +80,19 @@ class Transcriber:
         return self._model
 
     async def transcribe(self, path: str, language: Optional[str] = None) -> str:
-        if self.remote:
+        if not self.remote:
+            return await self._transcribe_local(path, language)
+        try:
             return await self._transcribe_remote(path, language or self.language)
-        return await self._transcribe_local(path, language)
+        except TranscriptionError as e:
+            # Сетевой сбой облачного ASR (не ответ сервиса вроде 400/401) —
+            # пробуем локальный Whisper вместо немедленного отказа
+            if e.network and self.local_available():
+                log.warning(
+                    "Облачный ASR недоступен (%s) — переключаюсь на локальный Whisper", e
+                )
+                return await self._transcribe_local(path, language)
+            raise
 
     async def _transcribe_remote(self, path: str, language: str) -> str:
         """OpenAI-совместимый POST /audio/transcriptions (multipart)."""
@@ -76,10 +100,13 @@ class Transcriber:
         data = {"model": self.api_model, "response_format": "json"}
         if language:
             data["language"] = language
+        # Раздельные таймауты: заблокированный/недоступный хост отваливается
+        # за секунды на этапе соединения, а не ждёт полный read-таймаут
+        timeout = httpx.Timeout(connect=self.connect_timeout, read=120.0, write=30.0, pool=10.0)
         try:
             with open(path, "rb") as f:
                 files = {"file": (os.path.basename(path), f, "audio/ogg")}
-                async with httpx.AsyncClient(timeout=120.0) as client:
+                async with httpx.AsyncClient(timeout=timeout) as client:
                     resp = await client.post(
                         f"{self.api_base}/audio/transcriptions",
                         headers=headers, data=data, files=files,
@@ -87,12 +114,16 @@ class Transcriber:
             resp.raise_for_status()
             text = str(resp.json().get("text", "")).strip()
         except httpx.HTTPStatusError as e:
+            # Сервис ответил (пусть и ошибкой) — это конфигурация (неверный
+            # ключ/модель), а не недоступность сети; на локальный не откатываем
             raise TranscriptionError(
                 f"ASR API вернул {e.response.status_code}: {e.response.text[:200]}",
                 public="ошибка сервиса",
             ) from e
         except (httpx.HTTPError, ValueError) as e:
-            raise TranscriptionError(f"ASR API недоступен: {e}", public="сервис недоступен") from e
+            raise TranscriptionError(
+                f"ASR API недоступен: {e}", public="сервис недоступен", network=True
+            ) from e
         if not text:
             raise TranscriptionError("Речь не распознана (пустой результат)", public="пустое сообщение")
         return text

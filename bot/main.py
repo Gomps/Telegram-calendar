@@ -68,6 +68,8 @@ async def main() -> None:
     if cfg.asr_api_base:
         log.info("Распознавание речи: облачное API %s (модель %s, язык %s)",
                  cfg.asr_api_base, cfg.asr_model, cfg.asr_language)
+        if Transcriber.local_available():
+            log.info("При недоступности облачного ASR — автоматический откат на локальный Whisper")
     else:
         log.info("Распознавание речи: локальный Whisper «%s»", cfg.whisper_model)
 
@@ -81,7 +83,8 @@ async def main() -> None:
         ]
     llm = LLMClient(
         providers=providers, retries=cfg.llm_retries, timeout=cfg.llm_timeout,
-        attempts_per_model=cfg.llm_attempts_per_model,
+        connect_timeout=cfg.llm_connect_timeout,
+        attempts_per_model=cfg.llm_attempts_per_model, cooldown=cfg.llm_cooldown,
     )
     log.info("Цепочка LLM (по %d попытки на модель): %s",
              cfg.llm_attempts_per_model, llm.describe())
@@ -110,6 +113,7 @@ async def main() -> None:
         api_key=cfg.asr_api_key,
         api_model=cfg.asr_model,
         language=cfg.asr_language,
+        connect_timeout=cfg.llm_connect_timeout,
     )
     dp["cfg"] = cfg
     dp["logbuffer"] = logbuffer

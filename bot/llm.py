@@ -310,9 +310,9 @@ class LLMClient:
 
     def __init__(
         self, base_url: str = "", model: str = "", api_key: str = "",
-        retries: int = 3, timeout: float = 120.0,
+        retries: int = 3, timeout: float = 120.0, connect_timeout: float = 10.0,
         providers: Optional[list[LLMProvider]] = None,
-        attempts_per_model: int = 3,
+        attempts_per_model: int = 3, cooldown: float = 120.0,
     ):
         if providers is None:
             providers = [LLMProvider(base_url, api_key, model)]
@@ -320,9 +320,14 @@ class LLMClient:
             LLMProvider(p.base_url.rstrip("/"), p.api_key, p.model) for p in providers
         ]
         self.retries = retries
-        self.timeout = timeout
+        # Раздельные таймауты: заблокированный/недоступный хост (например,
+        # гео-блок) должен отваливаться за секунды на этапе соединения, а не
+        # ждать полный read-таймаут, как обычный медленно отвечающий сервер.
+        self.timeout = httpx.Timeout(connect=connect_timeout, read=timeout, write=30.0, pool=10.0)
         self.attempts_per_model = max(1, attempts_per_model)
+        self.cooldown = cooldown
         self._active = 0  # индекс последнего работавшего провайдера
+        self._down_until: dict[int, float] = {}  # индекс провайдера -> monotonic до какого лежит
 
     # совместимость со старым однопровайдерным интерфейсом
     @property
@@ -402,23 +407,57 @@ class LLMClient:
             })
         raise LLMBadResponse("; ".join(last_errors))
 
+    def _is_down(self, idx: int, now: float) -> bool:
+        return self._down_until.get(idx, 0.0) > now
+
+    def _mark_down(self, idx: int) -> None:
+        self._down_until[idx] = asyncio.get_event_loop().time() + self.cooldown
+        log.warning(
+            "LLM %s помечена недоступной на %.0f с (кулдаун)",
+            self.providers[idx].label(), self.cooldown,
+        )
+
+    def _mark_up(self, idx: int) -> None:
+        self._down_until.pop(idx, None)
+
     async def _chat(self, messages: list[dict]) -> str:
-        """Перебор цепочки провайдеров: по attempts_per_model попыток на каждого."""
-        errors: list[str] = []
+        """Перебор цепочки провайдеров: по attempts_per_model попыток на каждого.
+
+        Провайдеры в кулдауне (недавно исчерпали попытки/получили постоянную
+        ошибку) пропускаются без попыток — не тратим время на заведомо мёртвый
+        хост на каждом сообщении. Если в кулдауне абсолютно все — это, скорее
+        всего, устаревшие пометки или единственный провайдер, поэтому пробуем
+        всех как обычно, а не отказываем сразу.
+        """
+        now = asyncio.get_event_loop().time()
         n = len(self.providers)
-        for shift in range(n):
-            idx = (self._active + shift) % n
+        order = [(self._active + shift) % n for shift in range(n)]
+        candidates = [i for i in order if not self._is_down(i, now)]
+        skipped = [i for i in order if self._is_down(i, now)]
+        if not candidates:
+            candidates = order  # все в кулдауне — не отказываем без попытки
+            skipped = []
+        if skipped:
+            log.info(
+                "LLM: пропускаю в кулдауне: %s",
+                ", ".join(self.providers[i].label() for i in skipped),
+            )
+
+        errors: list[str] = []
+        for idx in candidates:
             provider = self.providers[idx]
             for attempt in range(1, self.attempts_per_model + 1):
                 try:
                     content = await self._chat_once(provider, messages)
                     self._active = idx
+                    self._mark_up(idx)
                     return content
                 except _PermanentProviderError as e:
-                    # 401/403/404 — повторять на этом провайдере бессмысленно
+                    # 400/401/403/404 — повторять на этом провайдере бессмысленно
                     errors.append(f"{provider.label()}: {e}")
                     log.warning("LLM %s: постоянная ошибка (%s) — следующая модель",
                                 provider.label(), e)
+                    self._mark_down(idx)
                     break
                 except LLMUnavailable as e:
                     errors.append(f"{provider.label()}#{attempt}: {e}")
@@ -426,6 +465,8 @@ class LLMClient:
                                 provider.label(), attempt, self.attempts_per_model, e)
                     if attempt < self.attempts_per_model:
                         await asyncio.sleep(min(2 ** (attempt - 1), 4))
+                    else:
+                        self._mark_down(idx)
         raise LLMUnavailable("все модели недоступны: " + " | ".join(errors[-4:]))
 
     async def _chat_once(self, provider: LLMProvider, messages: list[dict]) -> str:
@@ -462,9 +503,10 @@ class LLMClient:
 
     async def healthcheck(self) -> tuple[bool, bool]:
         """(хоть один провайдер доступен, модель существует у него)."""
+        hc_timeout = httpx.Timeout(connect=self.timeout.connect, read=15.0, write=10.0, pool=10.0)
         for provider in self.providers:
             try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
+                async with httpx.AsyncClient(timeout=hc_timeout) as client:
                     resp = await client.get(
                         f"{provider.base_url}/models", headers=self._headers(provider)
                     )

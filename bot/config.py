@@ -59,6 +59,14 @@ class Config:
     # Таймаут запроса к Ollama, сек. Холодная загрузка модели на CPU
     # (особенно под Windows) может занимать минуты — не занижайте.
     llm_timeout: float
+    # Таймаут ТОЛЬКО на установку соединения, сек. Отдельно от llm_timeout:
+    # заблокированный/недоступный хост должен отваливаться быстро (секунды),
+    # а не ждать полный llm_timeout, как обычный медленный ответ модели.
+    llm_connect_timeout: float
+    # На сколько секунд провайдер помечается недоступным после исчерпания
+    # попыток — следующие сообщения пропускают его без повторных попыток,
+    # пока кулдаун не истечёт.
+    llm_cooldown: float
     # Насколько поздно (сек) напоминание ещё считается «вовремя», а не просроченным
     overdue_threshold: int
     # Пропущенное срабатывание серии старше этого (сек) не отправляется, а считается пропущенным
@@ -119,6 +127,8 @@ def load_config() -> Config:
         poll_interval=int(os.getenv("POLL_INTERVAL", "15")),
         llm_retries=int(os.getenv("LLM_RETRIES", "3")),
         llm_timeout=float(os.getenv("LLM_TIMEOUT", "180")),
+        llm_connect_timeout=float(os.getenv("LLM_CONNECT_TIMEOUT", "10")),
+        llm_cooldown=float(os.getenv("LLM_COOLDOWN", "120")),
         overdue_threshold=int(os.getenv("OVERDUE_THRESHOLD", "120")),
         series_grace=int(os.getenv("SERIES_GRACE", "900")),
     )
