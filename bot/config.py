@@ -71,6 +71,18 @@ class Config:
     overdue_threshold: int
     # Пропущенное срабатывание серии старше этого (сек) не отправляется, а считается пропущенным
     series_grace: int
+    # Telegram Mini App: веб-интерфейс со всем функционалом бота
+    webapp_enabled: bool
+    webapp_host: str
+    webapp_port: int
+    # Публичный HTTPS-адрес мини-аппа (без него кнопка не показывается,
+    # но сам HTTP-сервер всё равно поднимается — можно завести реверс-прокси)
+    webapp_url: str
+    # Сколько секунд считать initData свежим (защита от повторной отправки)
+    webapp_init_data_max_age: int
+    # Принимать заголовок X-Dev-User-Id вместо настоящей подписи Telegram —
+    # ТОЛЬКО для локальной разработки без реального Telegram-клиента
+    webapp_allow_dev_auth: bool
 
 
 def load_config() -> Config:
@@ -131,4 +143,10 @@ def load_config() -> Config:
         llm_cooldown=float(os.getenv("LLM_COOLDOWN", "120")),
         overdue_threshold=int(os.getenv("OVERDUE_THRESHOLD", "120")),
         series_grace=int(os.getenv("SERIES_GRACE", "900")),
+        webapp_enabled=os.getenv("WEBAPP_ENABLED", "0").strip() in ("1", "true", "yes"),
+        webapp_host=os.getenv("WEBAPP_HOST", "0.0.0.0").strip(),
+        webapp_port=int(os.getenv("WEBAPP_PORT", "8080")),
+        webapp_url=os.getenv("WEBAPP_URL", "").strip().rstrip("/"),
+        webapp_init_data_max_age=int(os.getenv("WEBAPP_INIT_DATA_MAX_AGE", "86400")),
+        webapp_allow_dev_auth=os.getenv("WEBAPP_ALLOW_DEV_AUTH", "0").strip() in ("1", "true", "yes"),
     )

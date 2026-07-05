@@ -17,6 +17,7 @@ from .llm import LLMClient, LLMProvider
 from .logbuffer import MemoryLogHandler
 from .scheduler import ReminderScheduler
 from .transcribe import Transcriber
+from .webapp import start_webapp
 
 log = logging.getLogger(__name__)
 
@@ -132,11 +133,45 @@ async def main() -> None:
     scheduler = ReminderScheduler(bot, db, cfg)
     scheduler.start()
 
+    webapp_runner = None
+    if cfg.webapp_enabled:
+        webapp_runner = await start_webapp(db, llm, cfg)
+        if cfg.webapp_url:
+            if not cfg.webapp_url.startswith("https://"):
+                log.warning(
+                    "WEBAPP_URL «%s» не начинается с https:// — Telegram Mini App "
+                    "требует HTTPS, кнопка в боте работать не будет (заведи "
+                    "реверс-прокси/туннель с TLS).", cfg.webapp_url,
+                )
+            try:
+                from aiogram.types import MenuButtonWebApp, WebAppInfo
+                await bot.set_chat_menu_button(
+                    menu_button=MenuButtonWebApp(
+                        text="Открыть", web_app=WebAppInfo(url=cfg.webapp_url)
+                    )
+                )
+                log.info("Кнопка меню Mini App настроена: %s", cfg.webapp_url)
+            except Exception:
+                log.exception("Не удалось настроить кнопку меню Mini App")
+        else:
+            log.info(
+                "Mini App поднят на %s:%d, но WEBAPP_URL не задан — кнопка в боте "
+                "не показывается (нужен публичный HTTPS-адрес сервера).",
+                cfg.webapp_host, cfg.webapp_port,
+            )
+        if cfg.webapp_allow_dev_auth:
+            log.warning(
+                "WEBAPP_ALLOW_DEV_AUTH включён — API мини-аппа принимает заголовок "
+                "X-Dev-User-Id БЕЗ проверки подписи Telegram. Только для разработки!"
+            )
+
     try:
         log.info("Запускаю поллинг Telegram…")
         await dp.start_polling(bot)
     finally:
         await scheduler.stop()
+        if webapp_runner is not None:
+            await webapp_runner.cleanup()
         await db.close()
         await bot.session.close()
 

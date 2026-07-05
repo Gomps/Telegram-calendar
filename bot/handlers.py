@@ -40,7 +40,13 @@ from .rules import (
     parse_hhmm,
 )
 from .timeparse import has_day_marker, parse_time_expression
-from .tzutil import city_to_tz, get_tz, offset_from_current_time, offset_tz_name
+from .tzutil import (
+    city_to_tz,
+    get_tz,
+    offset_from_current_time,
+    offset_tz_name,
+    resolve_timezone_input,
+)
 from .transcribe import Transcriber, TranscriptionError
 
 log = logging.getLogger(__name__)
@@ -76,6 +82,7 @@ HELP_TEXT = (
     "• «Если в 11:30 завтра не буду спать — напомни после обеда выпить таблетку» — "
     "в 11:30 задам вопрос; подтвердишь — напомню\n\n"
     "Команды:\n"
+    "/app — открыть мини-приложение (весь функционал в одном экране)\n"
     "/list — активные напоминания и серии\n"
     "/delete — удалить напоминание или серию\n"
     "/context — сохранённый распорядок\n"
@@ -302,6 +309,26 @@ async def cmd_start(message: Message, db: Database, cfg: Config) -> None:
     await message.answer("Привет! 👋\n\n" + HELP_TEXT)
 
 
+@router.message(Command("app"))
+async def cmd_app(message: Message, db: Database, cfg: Config) -> None:
+    await db.get_or_create_user(message.from_user.id, message.chat.id, cfg.default_tz)
+    if not cfg.webapp_url:
+        await message.answer(
+            "Мини-приложение не настроено администратором (нужен WEBAPP_URL в .env)."
+        )
+        return
+    from aiogram.types import WebAppInfo
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📱 Открыть приложение", web_app=WebAppInfo(url=cfg.webapp_url)),
+    ]])
+    await message.answer(
+        "Здесь — весь функционал бота в удобном виде: напоминания, серии, "
+        "условные, распорядок и часовой пояс.",
+        reply_markup=kb,
+    )
+
+
 @router.message(Command("context"))
 async def cmd_context(message: Message, db: Database, cfg: Config) -> None:
     user = await db.get_or_create_user(message.from_user.id, message.chat.id, cfg.default_tz)
@@ -372,18 +399,7 @@ async def cmd_timezone(message: Message, db: Database, cfg: Config) -> None:
         )
         return
     arg = parts[1].strip()
-
-    resolved = None
-    try:
-        get_tz(arg)
-        resolved = arg
-    except (ZoneInfoNotFoundError, ValueError, KeyError):
-        resolved = city_to_tz(arg)
-        if resolved is None:
-            t = parse_hhmm(arg)
-            if t is not None:
-                offset = offset_from_current_time(t.hour, t.minute, datetime.now(timezone.utc))
-                resolved = offset_tz_name(offset)
+    resolved = resolve_timezone_input(arg)
     if resolved is None:
         await message.answer(
             f"Не понял «{arg}». Примеры: /timezone Europe/Minsk, /timezone Минск, "

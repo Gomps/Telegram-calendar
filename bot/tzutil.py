@@ -6,9 +6,11 @@
 """
 
 import re
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from .rules import parse_hhmm
 
 UTC_OFFSET_RE = re.compile(r"^UTC([+-])(\d{2}):(\d{2})$")
 
@@ -65,3 +67,29 @@ def offset_from_current_time(user_hh: int, user_mm: int, now_utc) -> int:
     while diff < -12 * 60:
         diff += 24 * 60
     return round(diff / 15) * 15
+
+
+def resolve_timezone_input(arg: str) -> Optional[str]:
+    """Разбор часового пояса из произвольного пользовательского ввода.
+
+    Принимает IANA-имя («Europe/Minsk»), готовое смещение («UTC+03:00»),
+    город («Минск») или текущее время пользователя («16:45»). Общая логика
+    для команды /timezone и API мини-приложения — единственное место,
+    которое их обе используют, чтобы поведение не расходилось.
+    """
+    arg = str(arg).strip()
+    if not arg:
+        return None
+    try:
+        get_tz(arg)
+        return arg
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        pass
+    resolved = city_to_tz(arg)
+    if resolved is not None:
+        return resolved
+    t = parse_hhmm(arg)
+    if t is not None:
+        offset = offset_from_current_time(t.hour, t.minute, datetime.now(timezone.utc))
+        return offset_tz_name(offset)
+    return None

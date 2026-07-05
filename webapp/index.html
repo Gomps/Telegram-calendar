@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Напоминания</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+<div id="dev-banner" class="dev-banner" hidden>
+  Открыто не из Telegram — работает ограниченный тестовый режим.
+</div>
+
+<header class="topbar">
+  <div>
+    <div class="title">Напоминания</div>
+    <div id="clock" class="subtitle">—</div>
+  </div>
+  <button id="refresh-btn" class="icon-btn" title="Обновить">⟳</button>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Спросить бота</h2>
+    <p class="hint">Пиши как в чате: «Напомни завтра в 9 позвонить клиенту», «Я работаю с 9 до 18»…</p>
+    <textarea id="msg-input" rows="2" placeholder="Что и когда напомнить?"></textarea>
+    <button id="msg-send" class="primary-btn">Отправить</button>
+    <div id="msg-result" class="result" hidden></div>
+  </section>
+
+  <section class="card">
+    <h2>🔔 Разовые напоминания</h2>
+    <div id="reminders-list" class="list"><div class="empty">Загрузка…</div></div>
+  </section>
+
+  <section class="card">
+    <h2>🔁 Периодические</h2>
+    <div id="series-list" class="list"><div class="empty">Загрузка…</div></div>
+  </section>
+
+  <section class="card">
+    <h2>❓ Условные</h2>
+    <div id="conditionals-list" class="list"><div class="empty">Загрузка…</div></div>
+  </section>
+
+  <section class="card">
+    <h2>📋 Распорядок</h2>
+    <div id="context-list" class="list"><div class="empty">Загрузка…</div></div>
+    <div class="add-row">
+      <input id="ctx-key" type="text" placeholder="ключ (например work_end)">
+      <input id="ctx-value" type="text" placeholder="значение (например 18:00)">
+      <button id="ctx-add" class="secondary-btn">Сохранить</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>🌍 Часовой пояс</h2>
+    <div class="add-row">
+      <input id="tz-value" type="text" placeholder="Europe/Minsk, Минск, 16:45…">
+      <button id="tz-save" class="secondary-btn">Сохранить</button>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
