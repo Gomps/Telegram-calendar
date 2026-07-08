@@ -111,7 +111,7 @@ async def get_state(request: web.Request) -> web.Response:
     user_id = request["user_id"]
     cfg: Config = request.app["cfg"]
     db: Database = request.app["db"]
-    user = await db.get_or_create_user(user_id, user_id, cfg.default_tz)
+    user = await db.get_or_create_user(user_id, user_id, cfg.default_tz, update_chat=False)
     tz = get_tz(user["timezone"])
     now = datetime.now(timezone.utc)
     now_local = now.astimezone(tz)
@@ -134,6 +134,11 @@ async def get_state(request: web.Request) -> web.Response:
     })
 
 
+import re as _re
+
+CONTEXT_KEY_RE = _re.compile(r"^[a-zA-Z0-9_]{1,64}$")
+
+
 async def post_context(request: web.Request) -> web.Response:
     user_id = request["user_id"]
     cfg: Config = request.app["cfg"]
@@ -145,8 +150,18 @@ async def post_context(request: web.Request) -> web.Response:
     updates = body.get("updates")
     if not isinstance(updates, dict) or not updates:
         return _err(400, "updates must be a non-empty object")
+    # ключи — латиница/цифры/подчёркивание; значения — строка, список
+    # вариантов или null (удаление). Прочие типы в контексте не нужны и
+    # только ломали бы отображение.
+    for key, value in updates.items():
+        if not isinstance(key, str) or not CONTEXT_KEY_RE.match(key):
+            return _err(400, f"недопустимый ключ «{key}» (латиница, цифры, _, до 64 символов)")
+        if value is not None and not isinstance(value, (str, list)):
+            return _err(400, f"значение «{key}» должно быть строкой, списком или null")
+        if isinstance(value, str) and len(value) > 256:
+            return _err(400, f"значение «{key}» слишком длинное")
 
-    await db.get_or_create_user(user_id, user_id, cfg.default_tz)
+    await db.get_or_create_user(user_id, user_id, cfg.default_tz, update_chat=False)
     action = {"action": "save_context", "context_updates": updates}
     normalize_action(action)
     errors = validate_action(action)
@@ -160,7 +175,11 @@ async def post_context(request: web.Request) -> web.Response:
 async def delete_context_key(request: web.Request) -> web.Response:
     user_id = request["user_id"]
     key = request.match_info["key"]
+    cfg: Config = request.app["cfg"]
     db: Database = request.app["db"]
+    # без get_or_create update_context падал бы 500-й для пользователя,
+    # который открыл мини-апп раньше, чем написал боту
+    await db.get_or_create_user(user_id, user_id, cfg.default_tz, update_chat=False)
     await db.update_context(user_id, {key: None})
     log.info("Mini App: пользователь %d удалил ключ контекста «%s»", user_id, key)
     return web.json_response({"ok": True})
@@ -177,7 +196,7 @@ async def post_timezone(request: web.Request) -> web.Response:
     value = str(body.get("value") or "").strip()
     if not value:
         return _err(400, "value is required")
-    await db.get_or_create_user(user_id, user_id, cfg.default_tz)
+    await db.get_or_create_user(user_id, user_id, cfg.default_tz, update_chat=False)
     resolved = resolve_timezone_input(value)
     if resolved is None:
         return _err(400, f"не понял «{value}»")
@@ -240,8 +259,14 @@ async def post_message(request: web.Request) -> web.Response:
     text = str(body.get("text") or "").strip()
     if not text:
         return _err(400, "text is required")
+    if len(text) > 4096:  # лимит Telegram-сообщения; заодно защита LLM-бюджета
+        return _err(400, "text too long (max 4096)")
     log.info("Mini App: сообщение от %d: %s", user_id, text)
-    result = await nlpipe.process_message(user_id, user_id, text, db, llm, cfg)
+    try:
+        result = await nlpipe.process_message(user_id, user_id, text, db, llm, cfg)
+    except Exception:
+        log.exception("Mini App: ошибка обработки сообщения пользователя %d", user_id)
+        return _err(500, "внутренняя ошибка обработки")
     return web.json_response(result)
 
 

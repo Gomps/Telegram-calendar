@@ -135,7 +135,14 @@ async def main() -> None:
 
     webapp_runner = None
     if cfg.webapp_enabled:
-        webapp_runner = await start_webapp(db, llm, cfg)
+        try:
+            webapp_runner = await start_webapp(db, llm, cfg)
+        except OSError as e:
+            # занятый порт и т.п. не должны убивать бота — он полноценно
+            # работает и без мини-аппа
+            log.error("Не удалось поднять Mini App на %s:%d (%s) — продолжаю без него",
+                      cfg.webapp_host, cfg.webapp_port, e)
+    if webapp_runner is not None:
         if cfg.webapp_url:
             if not cfg.webapp_url.startswith("https://"):
                 log.warning(

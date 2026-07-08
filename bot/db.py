@@ -117,7 +117,12 @@ class Database:
 
     # --- пользователи и контекст -------------------------------------------
 
-    async def get_or_create_user(self, user_id: int, chat_id: int, default_tz: str) -> dict:
+    async def get_or_create_user(
+        self, user_id: int, chat_id: int, default_tz: str, update_chat: bool = True
+    ) -> dict:
+        """update_chat=False — для вызовов не из Telegram (мини-апп): там
+        настоящий chat_id неизвестен, и затирать сохранённый нельзя —
+        напоминания перестали бы доходить в правильный чат."""
         cur = await self.db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         row = await cur.fetchone()
         if row is None:
@@ -128,14 +133,14 @@ class Database:
             )
             await self.db.commit()
             return {"user_id": user_id, "chat_id": chat_id, "timezone": default_tz, "context": {}}
-        if row["chat_id"] != chat_id:
+        if update_chat and row["chat_id"] != chat_id:
             await self.db.execute(
                 "UPDATE users SET chat_id = ? WHERE user_id = ?", (chat_id, user_id)
             )
             await self.db.commit()
         return {
             "user_id": row["user_id"],
-            "chat_id": chat_id,
+            "chat_id": chat_id if update_chat else row["chat_id"],
             "timezone": row["timezone"],
             "context": json.loads(row["context_json"]),
         }

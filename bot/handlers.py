@@ -347,10 +347,16 @@ async def cmd_context(message: Message, db: Database, cfg: Config) -> None:
         )
         return
     lines = [f"• {context_label(k)}: {fmt_context_value(v)}" for k, v in sorted(ctx.items())]
-    buttons = [
-        [InlineKeyboardButton(text=f"🗑 {context_label(k)}", callback_data=f"ctxdel:{k}"[:64])]
-        for k in sorted(ctx)
-    ]
+    # Telegram ограничивает callback_data 64 байтами; обрезать ключ нельзя —
+    # кнопка удаляла бы не тот ключ. Слишком длинные ключи остаются без
+    # кнопки (их можно удалить фразой или через мини-апп).
+    buttons = []
+    for k in sorted(ctx):
+        cb = f"ctxdel:{k}"
+        if len(cb.encode("utf-8")) <= 64:
+            buttons.append(
+                [InlineKeyboardButton(text=f"🗑 {context_label(k)}", callback_data=cb)]
+            )
     await message.answer(
         "📋 Твой распорядок:\n" + "\n".join(lines) + clock
         + "\n\nИзменить значение — просто напиши новое («теперь работаю до 17»), "

@@ -32,7 +32,9 @@ async def process_message(
 
     {kind, message, created: {type, id} | None, text_mismatch: {...} | None}
     """
-    user = await db.get_or_create_user(user_id, chat_id, cfg.default_tz)
+    # update_chat=False: вызов приходит из мини-аппа, где настоящий chat_id
+    # неизвестен — сохранённый Telegram'ом чат затирать нельзя
+    user = await db.get_or_create_user(user_id, chat_id, cfg.default_tz, update_chat=False)
     tz = get_tz(user["timezone"])
     now_local = datetime.now(timezone.utc).astimezone(tz)
     pending = await db.get_pending_clarification(user_id)
