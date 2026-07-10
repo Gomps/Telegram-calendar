@@ -1,4 +1,4 @@
-"""Клиент LLM: любой OpenAI-совместимый API (NVIDIA NIM, Ollama /v1, OpenRouter…).
+"""Клиент LLM: любой облачный OpenAI-совместимый API (NVIDIA NIM, OpenRouter, Groq…).
 
 Валидация JSON-ответа и повторные попытки: при невалидном JSON (или JSON,
 не проходящем схему) модель получает свой ответ обратно вместе со списком
@@ -301,7 +301,7 @@ class LLMProvider:
 
 
 class LLMClient:
-    """OpenAI-совместимый chat-клиент (NVIDIA NIM, Ollama /v1, OpenRouter…).
+    """OpenAI-совместимый chat-клиент (NVIDIA NIM, OpenRouter, Groq…).
 
     Поддерживает цепочку провайдеров/моделей: недоступна одна — до
     attempts_per_model попыток, затем следующая, пока цепочка не кончится.
@@ -522,7 +522,3 @@ class LLMClient:
 
 class _PermanentProviderError(LLMUnavailable):
     """Ошибка провайдера, при которой повторные попытки бессмысленны."""
-
-
-# Обратная совместимость со старым именем
-OllamaClient = LLMClient

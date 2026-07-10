@@ -3,9 +3,9 @@
 Бот принимает текстовые и голосовые сообщения на естественном языке, понимает
 относительное время («после работы», «за два часа до сна») на основе
 сохранённого распорядка пользователя и доставляет напоминания точно в срок.
-Понимание языка — LLM через **любой OpenAI-совместимый API** (по умолчанию
-бесплатный **NVIDIA NIM**, `qwen/qwen3.5-122b-a10b`, с цепочкой фолбэков;
-локальная Ollama тоже поддерживается), распознавание речи — облачный
+Понимание языка — LLM через **облачный OpenAI-совместимый API** (по
+умолчанию бесплатный **NVIDIA NIM**, `qwen/qwen3.5-122b-a10b`, с цепочкой
+фолбэков на другие облачные модели), распознавание речи — облачный
 **whisper-large-v3** (например, бесплатный Groq) или локальный Whisper,
 хранение — **SQLite**. Весь функционал дополнительно доступен как
 **Telegram Mini App** — веб-интерфейс, открывающийся прямо внутри Telegram.
@@ -160,10 +160,10 @@ LLM возвращает `multi` со списком действий (разо�
 | **Python-пакеты** | aiogram, aiosqlite, httpx, python-dotenv, tzdata | `pip install -r requirements.txt` |
 | **Токен Telegram-бота** | доступ к Telegram Bot API | получить у [@BotFather](https://t.me/BotFather), вписать в `.env` |
 
-**Локальный режим (опционально, фолбэк)** — если хочется без облака:
-Ollama (`LLM_API_BASE=http://localhost:11434/v1` + любая модель), локальный
-Whisper (`ASR_API_BASE` пустой; нужны `openai-whisper` из requirements,
-ffmpeg и ~2 ГБ под модель; на слабой машине `WHISPER_MODEL=small`).
+**Локальный фолбэк есть только у распознавания речи**: локальный Whisper
+(`ASR_API_BASE` пустой; нужны `openai-whisper` из requirements, ffmpeg и
+~2 ГБ под модель; на слабой машине `WHISPER_MODEL=small`). LLM — только
+облачная: локальный запуск моделей не поддерживается.
 
 ## Установка по шагам
 
@@ -179,7 +179,7 @@ sudo apt install ffmpeg        # Debian/Ubuntu
 
 - **LLM**: на [build.nvidia.com](https://build.nvidia.com) сгенерируйте ключ
   `nvapi-…` и впишите его в `.env` (`LLM_API_KEY`). Модель по умолчанию —
-  `meta/llama-3.3-70b-instruct` (бесплатные кредиты); менять — `LLM_MODEL`.
+  `qwen/qwen3.5-122b-a10b` (бесплатные кредиты); менять — `LLM_MODELS`.
 - **Голосовые** (опционально): бесплатный ключ на
   [console.groq.com](https://console.groq.com), затем в `.env`:
   `ASR_API_BASE=https://api.groq.com/openai/v1`, `ASR_API_KEY=gsk_…`.
@@ -190,16 +190,13 @@ https://integrate.api.nvidia.com/v1/models` — вернёт список мод
 
 > **Гео-блокировка**: NVIDIA API недоступен из некоторых стран (Беларусь,
 > Россия) — «All connection attempts failed». Решения: VPN/прокси на машине
-> бота, либо запасной провайдер в `.env` (`LLM_FALLBACK_API_BASE` — например,
-> локальная Ollama), либо другой OpenAI-совместимый сервис в `LLM_API_BASE`.
+> бота, либо другой облачный OpenAI-совместимый провайдер — основным
+> (`LLM_API_BASE`) или запасным (`LLM_FALLBACK_API_BASE`), например
+> OpenRouter (openrouter.ai, есть бесплатные модели).
 
 **Отказоустойчивость**: `LLM_MODELS` — цепочка моделей; каждая пробуется
 до `LLM_ATTEMPTS_PER_MODEL` раз (с паузами), затем следующая, затем модели
 запасного провайдера. Последняя работавшая запоминается и пробуется первой.
-
-Локальная альтернатива (Ollama): `LLM_API_BASE=http://localhost:11434/v1`,
-`LLM_MODEL=qwen3.5:4b` — бот работает с ним через тот же OpenAI-совместимый
-клиент.
 
 ### 3. Python-окружение
 
@@ -222,8 +219,8 @@ cp .env.example .env
 # впишите BOT_TOKEN (от @BotFather) в .env
 ```
 
-Все параметры (`OLLAMA_URL`, `OLLAMA_MODEL`, `WHISPER_MODEL`, `DEFAULT_TZ`,
-`DB_PATH`, `POLL_INTERVAL`) — в `.env.example`. Часовой пояс по умолчанию —
+Все параметры (`LLM_API_BASE`, `LLM_MODELS`, `ASR_API_BASE`, `WHISPER_MODEL`,
+`DEFAULT_TZ`, `DB_PATH`, `POLL_INTERVAL` и другие) — в `.env.example`. Часовой пояс по умолчанию —
 `Europe/Minsk`, каждый пользователь может сменить свой командой `/timezone`.
 
 ### 5. Запуск

@@ -28,13 +28,13 @@ class Config:
     admin_ids: tuple[int, ...]
     # Статический белый список из .env (в дополнение к добавленным через /adduser)
     allowed_ids: tuple[int, ...]
-    # LLM: любой OpenAI-совместимый API (NVIDIA NIM, Ollama /v1, OpenRouter…)
+    # LLM: любой облачный OpenAI-совместимый API (NVIDIA NIM, OpenRouter, Groq…)
     llm_api_base: str
     llm_api_key: str
     llm_model: str
     # Цепочка моделей основного провайдера: недоступна одна — берём следующую
     llm_models: tuple[str, ...]
-    # Запасной провайдер (например, локальная Ollama), пробуется после основного
+    # Запасной облачный провайдер, пробуется после основной цепочки
     llm_fallback_api_base: str
     llm_fallback_api_key: str
     llm_fallback_models: tuple[str, ...]
@@ -56,8 +56,7 @@ class Config:
     log_file: str
     poll_interval: int
     llm_retries: int
-    # Таймаут запроса к Ollama, сек. Холодная загрузка модели на CPU
-    # (особенно под Windows) может занимать минуты — не занижайте.
+    # Таймаут ответа LLM API, сек
     llm_timeout: float
     # Таймаут ТОЛЬКО на установку соединения, сек. Отдельно от llm_timeout:
     # заблокированный/недоступный хост должен отваливаться быстро (секунды),
@@ -91,18 +90,11 @@ def load_config() -> Config:
         raise RuntimeError(
             "BOT_TOKEN не задан. Скопируйте .env.example в .env и впишите токен бота."
         )
-    # Обратная совместимость: если заданы старые OLLAMA_URL/OLLAMA_MODEL,
-    # используем OpenAI-совместимый эндпоинт Ollama (/v1)
-    llm_api_base = os.getenv("LLM_API_BASE", "").strip().rstrip("/")
-    llm_model = os.getenv("LLM_MODEL", "").strip()
-    ollama_url = os.getenv("OLLAMA_URL", "").strip().rstrip("/")
-    if not llm_api_base:
-        if ollama_url:
-            llm_api_base = ollama_url + "/v1"
-        else:
-            llm_api_base = "https://integrate.api.nvidia.com/v1"
-    if not llm_model:
-        llm_model = os.getenv("OLLAMA_MODEL", "").strip() or "qwen/qwen3.5-122b-a10b"
+    llm_api_base = (
+        os.getenv("LLM_API_BASE", "").strip().rstrip("/")
+        or "https://integrate.api.nvidia.com/v1"
+    )
+    llm_model = os.getenv("LLM_MODEL", "").strip() or "qwen/qwen3.5-122b-a10b"
 
     models_raw = os.getenv(
         "LLM_MODELS",
